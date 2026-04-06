@@ -17,15 +17,30 @@ class BotConfig:
     private_key: str
     wallet_address: str
     polygon_rpc_url: str
-    position_size_fraction: float
+
+    # Entry
+    entry_window_seconds: int
     max_buy_price: float
     abort_price: float
-    entry_window_seconds: int
-    momentum_lookback_seconds: int
-    volatility_threshold: float
     min_market_liquidity: float
+
+    # Distance strategy
+    min_btc_distance: float
+    volatility_threshold: float
+    momentum_confirmation_required: int
+
+    # Confidence-based sizing
+    high_confidence_threshold: float
+    medium_confidence_threshold: float
+    high_confidence_size: float
+    medium_confidence_size: float
+    position_size_fraction: float  # fallback
+
+    # Harvester
     harvest_poll_interval: int
     max_recent_markets: int
+
+    # Paper trading
     paper_trading: bool = False
     paper_balance: float = 100.0
 
@@ -38,21 +53,26 @@ class BotConfig:
 
         if not paper:
             if not private_key:
-                raise ValueError("PRIVATE_KEY is required in .env (or set PAPER_TRADING=true)")
+                raise ValueError("PRIVATE_KEY required (or set PAPER_TRADING=true)")
             if not wallet_address:
-                raise ValueError("WALLET_ADDRESS is required in .env (or set PAPER_TRADING=true)")
+                raise ValueError("WALLET_ADDRESS required (or set PAPER_TRADING=true)")
 
         return cls(
             private_key=private_key or "0x_paper_mode",
             wallet_address=wallet_address or "0x0000000000000000000000000000000000000000",
-            polygon_rpc_url=os.environ.get("POLYGON_RPC_URL", "https://polygon-rpc.com"),
-            position_size_fraction=float(os.environ.get("POSITION_SIZE_FRACTION", "0.40")),
-            max_buy_price=float(os.environ.get("MAX_BUY_PRICE", "0.83")),
+            polygon_rpc_url=os.environ.get("POLYGON_RPC_URL", "https://polygon-bor-rpc.publicnode.com"),
+            entry_window_seconds=int(os.environ.get("ENTRY_WINDOW_SECONDS", "120")),
+            max_buy_price=float(os.environ.get("MAX_BUY_PRICE", "0.90")),
             abort_price=float(os.environ.get("ABORT_PRICE", "0.99")),
-            entry_window_seconds=int(os.environ.get("ENTRY_WINDOW_SECONDS", "40")),
-            momentum_lookback_seconds=int(os.environ.get("MOMENTUM_LOOKBACK_SECONDS", "30")),
-            volatility_threshold=float(os.environ.get("VOLATILITY_THRESHOLD", "0.003")),
             min_market_liquidity=float(os.environ.get("MIN_MARKET_LIQUIDITY", "1000")),
+            min_btc_distance=float(os.environ.get("MIN_BTC_DISTANCE", "12.0")),
+            volatility_threshold=float(os.environ.get("VOLATILITY_THRESHOLD", "0.005")),
+            momentum_confirmation_required=int(os.environ.get("MOMENTUM_CONFIRMATION_REQUIRED", "0")),
+            high_confidence_threshold=float(os.environ.get("HIGH_CONFIDENCE_THRESHOLD", "0.72")),
+            medium_confidence_threshold=float(os.environ.get("MEDIUM_CONFIDENCE_THRESHOLD", "0.60")),
+            high_confidence_size=float(os.environ.get("HIGH_CONFIDENCE_SIZE", "0.30")),
+            medium_confidence_size=float(os.environ.get("MEDIUM_CONFIDENCE_SIZE", "0.20")),
+            position_size_fraction=float(os.environ.get("POSITION_SIZE_FRACTION", "0.40")),
             harvest_poll_interval=int(os.environ.get("HARVEST_POLL_INTERVAL", "30")),
             max_recent_markets=int(os.environ.get("MAX_RECENT_MARKETS_TO_CHECK", "20")),
             paper_trading=paper,

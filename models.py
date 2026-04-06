@@ -28,16 +28,35 @@ class PriceSnapshot:
     price: float
     timestamp: float
     volume: float
+    is_buyer_maker: bool = False  # Binance "m" field: True = seller aggression
 
 
 @dataclass
 class PriceSignal:
+    # Core
     current_price: float
-    momentum: float
-    acceleration: float
+    price_to_beat: float
+    btc_distance: float           # current - price_to_beat (positive = Up)
+    seconds_remaining: float
+
+    # Distance confidence
+    distance_confidence: float
+
+    # Multi-timeframe momentum (confirmation)
+    momentum_10s: float
+    momentum_30s: float
+    momentum_60s: float
+    momentum_agreement: int       # 0-3 timeframes agreeing with distance direction
+
+    # Volume
+    buy_volume_ratio: float       # buy vol / total vol (>0.5 = bullish)
+    total_volume_30s: float
+
+    # Volatility
     volatility_30s: float
-    price_direction: str  # "up" | "down" | "flat"
     is_extreme_volatility: bool
-    is_resistance_wall: bool
-    confidence: float
-    recommended_side: str  # "Up" or "Down"
+
+    # Decision
+    recommended_side: str         # "Up" or "Down"
+    confidence: float             # final confidence after all adjustments
+    skip_reason: str | None = None

@@ -88,37 +88,48 @@ class Harvester:
         return False
 
     async def _redeem_position(self, market: MarketInfo) -> bool:
-        try:
-            wallet = Web3.to_checksum_address(self._config.wallet_address)
-            nonce = self._w3.eth.get_transaction_count(wallet)
+        wallet = Web3.to_checksum_address(self._config.wallet_address)
+        condition_bytes = bytes.fromhex(
+            market.condition_id[2:] if market.condition_id.startswith("0x") else market.condition_id
+        )
 
-            condition_bytes = bytes.fromhex(market.condition_id[2:] if market.condition_id.startswith("0x") else market.condition_id)
+        # Retry up to 3 times with increasing gas
+        for attempt in range(1, 4):
+            try:
+                nonce = self._w3.eth.get_transaction_count(wallet, "pending")
+                gas_multiplier = 1.5 + (attempt * 0.5)  # 2x, 2.5x, 3x
+                gas_price = int(self._w3.eth.gas_price * gas_multiplier)
 
-            tx = self._ctf_contract.functions.redeemPositions(
-                Web3.to_checksum_address(USDC_E),
-                ZERO_BYTES32,
-                condition_bytes,
-                INDEX_SETS,
-            ).build_transaction({
-                "chainId": 137,
-                "from": wallet,
-                "nonce": nonce,
-                "gasPrice": self._w3.eth.gas_price,
-                "gas": 200_000,
-            })
+                tx = self._ctf_contract.functions.redeemPositions(
+                    Web3.to_checksum_address(USDC_E),
+                    ZERO_BYTES32,
+                    condition_bytes,
+                    INDEX_SETS,
+                ).build_transaction({
+                    "chainId": 137,
+                    "from": wallet,
+                    "nonce": nonce,
+                    "gasPrice": gas_price,
+                    "gas": 250_000,
+                })
 
-            signed = self._w3.eth.account.sign_transaction(tx, self._config.private_key)
-            tx_hash = self._w3.eth.send_raw_transaction(signed.raw_transaction)
-            log.info("Redeem tx sent: %s", tx_hash.hex())
+                signed = self._w3.eth.account.sign_transaction(tx, self._config.private_key)
+                tx_hash = self._w3.eth.send_raw_transaction(signed.raw_transaction)
+                log.info("Redeem tx sent (attempt %d, gas %.1fx): %s", attempt, gas_multiplier, tx_hash.hex())
 
-            receipt = self._w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
-            if receipt["status"] == 1:
-                log.info("Redeem tx confirmed: %s (gas: %d)", tx_hash.hex(), receipt["gasUsed"])
-                return True
-            else:
-                log.error("Redeem tx reverted: %s", tx_hash.hex())
-                return False
+                receipt = self._w3.eth.wait_for_transaction_receipt(tx_hash, timeout=90)
+                if receipt["status"] == 1:
+                    log.info("Redeem CONFIRMED: %s (gas used: %d)", tx_hash.hex(), receipt["gasUsed"])
+                    return True
+                else:
+                    log.error("Redeem tx reverted: %s", tx_hash.hex())
+                    return False
 
-        except Exception as e:
-            log.error("Redeem transaction error: %s", e, exc_info=True)
-            return False
+            except Exception as e:
+                log.warning("Redeem attempt %d failed: %s", attempt, e)
+                if attempt < 3:
+                    import asyncio
+                    await asyncio.sleep(5)
+
+        log.error("Redeem failed after 3 attempts for window %d", market.window_ts)
+        return False

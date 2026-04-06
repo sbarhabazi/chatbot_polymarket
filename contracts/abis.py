@@ -37,6 +37,22 @@ ERC20_APPROVE_ABI = [
     }
 ]
 
+CHAINLINK_AGGREGATOR_ABI = [
+    {
+        "name": "latestRoundData",
+        "type": "function",
+        "inputs": [],
+        "outputs": [
+            {"name": "roundId", "type": "uint80"},
+            {"name": "answer", "type": "int256"},
+            {"name": "startedAt", "type": "uint256"},
+            {"name": "updatedAt", "type": "uint256"},
+            {"name": "answeredInRound", "type": "uint80"},
+        ],
+        "stateMutability": "view",
+    }
+]
+
 ERC1155_SET_APPROVAL_ABI = [
     {
         "name": "setApprovalForAll",

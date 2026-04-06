@@ -5,13 +5,14 @@ Two async processes run concurrently:
   - Process A (Sniper): Observes BTC price, applies entry rules, buys in last 40s
   - Process B (Harvester): Claims winning positions on resolved markets
 
-Modes:
-  - PAPER_TRADING=true  -> simulates trades, no real money
-  - PAPER_TRADING=false -> live trading (requires PRIVATE_KEY + WALLET_ADDRESS)
+Supports both USDC native and USDC.e:
+  - Auto-swaps USDC native -> USDC.e at startup if needed
+  - Polymarket uses USDC.e as collateral
 
 Usage:
     1. Copy .env.example to .env and configure
-    2. python main.py
+    2. python -m contracts.allowances  (once per wallet)
+    3. python main.py
 """
 
 import asyncio
@@ -35,8 +36,12 @@ async def main() -> None:
         log.info("  Paper balance: $%.2f", config.paper_balance)
         log.info("=" * 50)
 
-        clob_client = None
+        market_manager = MarketManager(config)
+        price_analyzer = PriceAnalyzer(config)
+        wallet_manager = WalletManager(config)
+        sniper = Sniper(config, market_manager, price_analyzer, wallet_manager)
         w3 = None
+        clob_client = None
     else:
         log.info("MODE: LIVE TRADING")
         log.info("Wallet: %s...%s", config.wallet_address[:8], config.wallet_address[-4:])
@@ -45,6 +50,33 @@ async def main() -> None:
         from web3 import Web3
         from web3.middleware import ExtraDataToPOAMiddleware
 
+        # Web3
+        w3 = Web3(Web3.HTTPProvider(config.polygon_rpc_url))
+        w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+        if not w3.is_connected():
+            log.error("Cannot connect to Polygon RPC: %s", config.polygon_rpc_url)
+            sys.exit(1)
+        log.info("Web3 connected to Polygon (chain %d)", w3.eth.chain_id)
+
+        # Auto-swap USDC native -> USDC.e if needed
+        from contracts.swap import get_native_usdc_balance, get_usdc_e_balance, swap_native_usdc_to_usdc_e
+
+        wallet = config.wallet_address
+        native_bal = get_native_usdc_balance(w3, wallet) / 1e6
+        usdc_e_bal = get_usdc_e_balance(w3, wallet) / 1e6
+        log.info("USDC.e: $%.2f | USDC native: $%.2f", usdc_e_bal, native_bal)
+
+        if native_bal > 1.0 and usdc_e_bal < 15.0:
+            log.info("Auto-swapping USDC native -> USDC.e...")
+            success = swap_native_usdc_to_usdc_e(w3, config.private_key, wallet)
+            if success:
+                usdc_e_bal = get_usdc_e_balance(w3, wallet) / 1e6
+                log.info("Swap done! New USDC.e balance: $%.2f", usdc_e_bal)
+            else:
+                log.error("Swap failed. Check logs above.")
+                sys.exit(1)
+
+        # CLOB client
         clob_client = ClobClient(
             host=CLOB_HOST,
             key=config.private_key,
@@ -54,24 +86,17 @@ async def main() -> None:
         clob_client.set_api_creds(clob_client.create_or_derive_api_creds())
         log.info("CLOB client initialized")
 
-        w3 = Web3(Web3.HTTPProvider(config.polygon_rpc_url))
-        w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
-        if not w3.is_connected():
-            log.error("Cannot connect to Polygon RPC: %s", config.polygon_rpc_url)
-            sys.exit(1)
-        log.info("Web3 connected to Polygon (chain %d)", w3.eth.chain_id)
+        # Components
+        market_manager = MarketManager(config)
+        price_analyzer = PriceAnalyzer(config)
+        wallet_manager = WalletManager(config, clob_client, w3)
+        sniper = Sniper(config, market_manager, price_analyzer, wallet_manager, clob_client, w3)
 
-    # Shared components
-    market_manager = MarketManager(config)
-    price_analyzer = PriceAnalyzer(config)
-    wallet_manager = WalletManager(config, clob_client)
-
+    # Log balance
     balance = await wallet_manager.get_usdc_balance(force_refresh=True)
-    log.info("USDC balance: $%.2f", balance)
+    log.info("Trading balance (USDC.e): $%.2f", balance)
 
-    # Processes
-    sniper = Sniper(config, market_manager, price_analyzer, wallet_manager, clob_client)
-
+    # Tasks
     tasks_to_run = []
 
     # Harvester only in live mode
@@ -117,7 +142,6 @@ async def main() -> None:
         await price_analyzer.stop()
         await market_manager.close()
 
-        # Print paper trading summary
         if config.paper_trading and sniper._paper_trades:
             log.info("=" * 50)
             log.info("PAPER TRADING SUMMARY")
@@ -127,11 +151,6 @@ async def main() -> None:
             log.info("  Total wagered: $%.2f", total_bet)
             log.info("  Total potential payout: $%.2f", total_potential)
             log.info("  Final balance: $%.2f", await wallet_manager.get_usdc_balance())
-            for t in sniper._paper_trades:
-                log.info(
-                    "    %s %s @ $%.3f | bet $%.2f | %.1f shares",
-                    t["window"], t["side"], t["price"], t["amount"], t["shares"],
-                )
             log.info("=" * 50)
 
         log.info("Bot shutdown complete.")
