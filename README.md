@@ -1,91 +1,112 @@
 # Polymarket 5-Min BTC Sniper Bot
 
-Bot de trading automatise pour les marches "Bitcoin Up or Down - 5 Minutes" de Polymarket sur la blockchain Polygon.
+Bot de trading automatisé pour les marchés "Bitcoin Up or Down - 5 Minutes" de Polymarket sur la blockchain Polygon.
+
+## Statut
+
+- **Déployé sur Railway** (projet `resplendent-magic`) — actif 24h/24
+- **Source de prix** : Kraken WS (fallback automatique depuis Binance, geo-bloqué sur Railway)
+- **Blockchain** : Polygon Mainnet
 
 ## Fonctionnement
 
-Le bot analyse le prix du BTC en temps reel via Binance WebSocket et place des paris sur Polymarket quand les conditions sont favorables.
+Le bot analyse le prix du BTC en temps réel et place des paris sur Polymarket quand les conditions sont favorables.
 
 ### Architecture
 
-Deux processus asynchrones tournent en parallele :
+Deux processus asynchrones tournent en parallèle :
 
-- **Process A (Sniper)** : Observe le prix BTC pendant la fenetre de 5 minutes, analyse la distance entre le prix actuel et le prix d'ouverture (via Chainlink Oracle), et place un ordre d'achat quand la confiance est suffisante.
-- **Process B (Harvester)** : Surveille les marches resolus et reclame automatiquement les gains sur la blockchain Polygon.
+- **Process A (Sniper)** : Observe le prix BTC, analyse la distance entre le prix actuel et le prix d'ouverture, et place un ordre quand la confiance est suffisante.
+- **Process B (Harvester)** : Surveille les marchés résolus et réclame automatiquement les gains sur la blockchain Polygon.
 
-### Strategie "Safe Scalper v4 - Early Entry"
+### Stratégie "Safe Scalper v5 — Composite Signal"
 
-1. **Observation** : Le bot ecoute le flux de prix BTC seconde par seconde
-2. **Prix de reference** : Le prix d'ouverture est capture via l'oracle Chainlink (meme source que Polymarket utilise pour la resolution)
-3. **Entree anticipee** : Le bot entre avec 60-120 secondes restantes (quand les shares sont encore a prix accessible)
-4. **Modele de confiance** : Table 2D calibree sur la distance BTC et le temps restant
-5. **Sizing dynamique** : Taille de position ajustee selon le niveau de confiance (HIGH: 30%, MEDIUM: 20%)
-6. **Ordres limite GTC** : Evite le slippage des market orders
+1. **Observation** : Le bot écoute le flux de prix BTC seconde par seconde
+2. **Prix de référence** : Capturé via l'API Gamma/Polymarket (finalPrice de la fenêtre précédente) ou via le flux live en approximation
+3. **Entrée anticipée** : Le bot entre dans les 60-120 secondes restantes
+4. **Modèle de confiance** : Table 2D calibrée (distance BTC × temps restant) + 7 indicateurs composites
+5. **Sizing dynamique** : Critère de Kelly fractionné (fraction=50%, cap=20%)
+6. **Ordres FOK** : Fill-Or-Kill pour éviter les ordres en suspens
 
-```
-Fenetre de 5 min :
-|--- Observation (3min) ---|--- Entry Window (2min) ---|
-                           ^                           ^
-                     Bot peut trader              Marche ferme
-```
+### Indicateurs composites (v5)
+
+| # | Indicateur | Impact |
+|---|---|---|
+| 1 | Distance confidence (table 2D) | Base |
+| 2 | Order Book Imbalance (OBI) | +0.08 / -0.10 |
+| 3 | Multi-TF Momentum (10s/30s/60s) | +0.05 / -0.08 |
+| 4 | Volume Acceleration (5s/15s/30s/60s) | +0.04 / -0.04 |
+| 5 | RSI (fast, 14 périodes sur ticks) | +0.03 / -0.04 |
+| 6 | VWAP déviation | +0.03 / -0.03 |
+| 7 | Trade Rate Spike | +0.03 / -0.03 |
+| 8 | Volatilité graduée | 0 / -0.03 / -0.06 / SKIP |
 
 ## Structure du projet
 
 ```
 chatbot_polymarket/
-  main.py                  # Point d'entree / orchestrateur async
-  config.py                # BotConfig charge depuis .env
+  main.py                  # Point d'entrée / orchestrateur async
+  config.py                # BotConfig + URLs des sources de prix
   models.py                # MarketInfo, PriceSnapshot, PriceSignal
-  logger.py                # Logging structure
-  market_manager.py        # Decouverte marche 5min via Gamma API
-  price_analyzer.py        # Binance WebSocket + modele de confiance 2D
-  sniper.py                # Process A : analyse + ordre limite GTC
+  logger.py                # Logging structuré
+  market_manager.py        # Découverte marché 5min via Gamma API
+  price_analyzer.py        # Multi-source BTC (Binance → Kraken → Coinbase → CoinGecko)
+  sniper.py                # Process A : analyse + ordre FOK/GTC
   harvester.py             # Process B : redeem on-chain (CTF)
-  wallet_manager.py        # Balance USDC + position sizing
+  wallet_manager.py        # Balance USDC + position sizing Kelly
+  monitor.py               # Analyse logs toutes les heures, healthcheck
+  optimizer.py             # Ajustements automatiques des paramètres
+  start.sh                 # Lance bot + monitor en parallèle
+  Dockerfile               # Image Python 3.11 slim, user non-root
+  railway.toml             # Config Railway (restart automatique)
   contracts/
     __init__.py
     addresses.py           # Adresses Polygon (CTF, USDC, Chainlink, Uniswap)
-    abis.py                # ABI fragments (redeem, balanceOf, approve, Chainlink)
+    abis.py                # ABI fragments
     allowances.py          # Setup one-shot des approbations (7 txs)
-    swap.py                # Swap USDC natif -> USDC.e via Uniswap V3
+    swap.py                # Swap USDC natif → USDC.e via Uniswap V3
   .env.example             # Template de configuration
-  requirements.txt         # Dependances Python
+  requirements.txt         # Dépendances Python
 ```
 
-## Prerequis
+## Sources de prix BTC (fallback automatique)
+
+Le bot essaie les sources dans l'ordre suivant :
+
+| Priorité | Source | Type | Latence |
+|---|---|---|---|
+| 1 | **Binance** | WebSocket | ~10ms |
+| 2 | **Kraken** | WebSocket | ~15ms |
+| 3 | **Coinbase** | WebSocket | ~20ms |
+| 4 | **CoinGecko** | REST (polling 2s) | ~2s |
+
+> Note : Binance est geo-bloqué (HTTP 451) depuis les serveurs Railway US. Le bot utilise automatiquement Kraken comme source principale.
+
+## Prérequis
 
 - Python 3.10+
 - Un wallet Polygon avec :
-  - USDC.e (capital de trading, minimum $20 recommande)
-  - POL (frais de gas, ~0.5 POL suffisant)
+  - USDC.e (capital de trading, minimum $20 recommandé)
+  - POL (frais de gas, ~1 POL suffisant)
 
 ## Installation
 
 ```bash
-# Cloner le repo
 git clone https://github.com/sbarhabazi/chatbot_polymarket.git
 cd chatbot_polymarket
-
-# Creer un environnement virtuel
 python3 -m venv .venv
 source .venv/bin/activate
-
-# Installer les dependances
 pip install -r requirements.txt
 ```
 
 ## Configuration
 
-### 1. Creer le fichier .env
-
 ```bash
 cp .env.example .env
-chmod 600 .env   # Securiser les permissions
+chmod 600 .env
 ```
 
-### 2. Renseigner les cles
-
-Editer `.env` et remplir :
+Remplir `.env` :
 
 ```
 PAPER_TRADING=false
@@ -93,92 +114,70 @@ PRIVATE_KEY=0xVOTRE_CLE_PRIVEE
 WALLET_ADDRESS=0xVOTRE_ADRESSE
 ```
 
-### 3. Parametres de trading
-
-| Parametre | Defaut | Description |
-|-----------|--------|-------------|
-| `ENTRY_WINDOW_SECONDS` | 120 | Fenetre d'entree (dernieres 120 secondes) |
-| `MAX_BUY_PRICE` | 0.90 | Prix max par share ($0.90 = yield min ~11%) |
-| `MIN_BTC_DISTANCE` | 12.0 | Distance min BTC vs prix d'ouverture ($) |
-| `HIGH_CONFIDENCE_THRESHOLD` | 0.72 | Seuil confiance tier HIGH (30% du capital) |
-| `MEDIUM_CONFIDENCE_THRESHOLD` | 0.60 | Seuil confiance tier MEDIUM (20% du capital) |
-| `HIGH_CONFIDENCE_SIZE` | 0.30 | Taille position HIGH (30%) |
-| `MEDIUM_CONFIDENCE_SIZE` | 0.20 | Taille position MEDIUM (20%) |
-
-### 4. Setup des approbations blockchain (une seule fois)
+### Setup des approbations blockchain (une seule fois)
 
 ```bash
 python -m contracts.allowances
 ```
 
-Cela envoie 7 transactions d'approbation sur Polygon :
-- 3x USDC.e approve pour les contracts Polymarket
-- 3x CTF setApprovalForAll pour les contracts Polymarket
-- 1x USDC natif approve pour Uniswap (swap automatique)
+Envoie 7 transactions d'approbation sur Polygon (USDC.e + CTF + Uniswap).
 
-## Utilisation
+## Déploiement Railway (recommandé)
 
-### Lancement en mode live
+1. Connecter le repo GitHub à Railway
+2. Ajouter les variables d'environnement dans l'onglet **Variables**
+3. Railway détecte le `Dockerfile` et déploie automatiquement
+4. Chaque `git push` sur `main` déclenche un redéploiement automatique
 
+### Variables d'environnement Railway
+
+| Variable | Description |
+|---|---|
+| `PAPER_TRADING` | `false` pour le live |
+| `PRIVATE_KEY` | Clé privée du wallet |
+| `WALLET_ADDRESS` | Adresse du wallet |
+| `POLYGON_RPC_URL` | RPC Polygon (défaut: publicnode) |
+| `MIN_BTC_DISTANCE` | Distance min BTC (défaut: 12.0) |
+| `HIGH_CONFIDENCE_THRESHOLD` | Seuil confiance HIGH (défaut: 0.72) |
+| `MEDIUM_CONFIDENCE_THRESHOLD` | Seuil confiance MEDIUM (défaut: 0.60) |
+| `HIGH_CONFIDENCE_SIZE` | Taille position HIGH (défaut: 0.30) |
+| `MEDIUM_CONFIDENCE_SIZE` | Taille position MEDIUM (défaut: 0.20) |
+
+## Monitoring et optimisation
+
+### Logs en temps réel
 ```bash
-source .venv/bin/activate
-python main.py
+# Railway : onglet Deployments → View Logs
+# Local :
+tail -f bot.log
 ```
 
-### Lancement en mode Paper Trading (simulation)
+### Rapport de performance (toutes les heures)
+Le `monitor.py` génère automatiquement un rapport dans les logs avec :
+- Nombre de trades, win rate par bucket
+- Capital engagé, positions remboursées
+- Raisons de SKIP les plus fréquentes
 
-Mettre dans `.env` :
-```
-PAPER_TRADING=true
-PAPER_BALANCE=100.00
-```
-
-### Lancement en arriere-plan
-
+### Optimiseur automatique
 ```bash
-nohup python main.py > bot.log 2>&1 &
-echo $! > bot.pid
+python optimizer.py          # Analyse et suggestions
+python optimizer.py --apply  # Applique les ajustements dans .env
 ```
 
-- Voir les logs : `tail -f bot.log`
-- Arreter : `kill $(cat bot.pid)`
+## Paramètres de trading
 
-## Comprendre les logs
+| Paramètre | Défaut | Description |
+|---|---|---|
+| `ENTRY_WINDOW_SECONDS` | 120 | Fenêtre d'entrée (dernières 120s) |
+| `MAX_BUY_PRICE` | 0.90 | Prix max par share (~11% yield min) |
+| `MIN_BTC_DISTANCE` | 12.0 | Distance min BTC vs prix d'ouverture ($) |
+| `HIGH_CONFIDENCE_THRESHOLD` | 0.72 | Seuil confiance tier HIGH |
+| `MEDIUM_CONFIDENCE_THRESHOLD` | 0.60 | Seuil confiance tier MEDIUM |
+| `KELLY_FRACTION` | 0.50 | Fraction Kelly |
+| `MAX_KELLY_SIZE` | 0.20 | Cap taille position (20% du capital) |
+| `ORDER_TYPE` | FOK | Fill-Or-Kill |
 
-### Observation
-```
-Observing 1775484000 | 176s left | BTC: $69,311.87 | beat=N/A | Up=$0.515 Down=$0.485
-```
-Le bot observe le marche. `beat=N/A` signifie que le prix de reference Chainlink n'est pas encore utilise (le sera a l'entree).
-
-### Entree dans la fenetre
-```
-=== ENTRY WINDOW [EARLY] === 115s remaining | window 1775484000
-Signal: Down | BTC=$69310.14 | beat=$69380.82 | dist=$-70.7 | conf=0.70
-```
-- `EARLY` : Entree anticipee (>60s restantes)
-- `dist=$-70.7` : BTC est $70.7 en-dessous du prix d'ouverture
-- `conf=0.70` : 70% de confiance
-
-### Decisions
-```
-BUY [HIGH]: Down | $5.49 (30% of $18.30) @ $0.495     # Achat execute
-SKIP: Distance $5.1 < min $12.0                        # Distance trop faible
-SKIP: Confidence 0.43 < minimum 0.60                   # Confiance insuffisante
-SKIP: Bet $3.87 < $5 min (balance=$12.91)              # Solde trop bas
-BUY NOT FILLED (no sellers at $0.49)                    # Pas de vendeurs
-```
-
-### Harvester
-```
-Found redeemable position: window 1775482200
-Redeem CONFIRMED: bcd6d435... (gas used: 74314)
-Redeemed successfully: window 1775482200
-```
-
-## Modele de confiance
-
-Le bot utilise une table 2D distance x temps pour estimer la probabilite que BTC reste du meme cote du prix d'ouverture :
+## Modèle de confiance (table 2D)
 
 ```
 | Distance | 120s | 90s  | 60s  | 40s  | 25s  | 10s  |
@@ -191,33 +190,6 @@ Le bot utilise une table 2D distance x temps pour estimer la probabilite que BTC
 | < $12    | SKIP | SKIP | SKIP | SKIP | SKIP | SKIP |
 ```
 
-Penalites appliquees :
-- Volatilite haute (>0.5%) : -0.08
-- Momentum oppose (dernieres 60s) : -0.05
-- Volume en contradiction : -0.03
-
-## Flux d'un trade
-
-```
-1. Chainlink Oracle → prix d'ouverture BTC ($69,380)
-2. Binance WebSocket → prix actuel BTC ($69,310)
-3. Distance = -$70 → confiance = 0.70
-4. Confiance >= 0.60 (MEDIUM) → BET 20% du solde
-5. Limit order GTC: 11 shares "Down" @ $0.49
-6. Si rempli → attendre resolution
-7. Si gagne → Harvester redeem on-chain → USDC.e retour wallet
-8. Cycle suivant avec solde mis a jour
-```
-
-## Securite
-
-- Ne jamais partager la cle privee
-- Toujours `chmod 600 .env` apres modification
-- Le fichier `.env` est exclu de Git via `.gitignore`
-- Toutes les connexions utilisent TLS/SSL
-- La cle privee n'apparait jamais dans les logs
-- Utiliser un wallet dedie (ne pas utiliser son wallet principal)
-
 ## Adresses des contrats (Polygon Mainnet)
 
 | Contrat | Adresse |
@@ -229,16 +201,14 @@ Penalites appliquees :
 | Chainlink BTC/USD | `0xc907E116054Ad103354f2D350FD2514433D57F6f` |
 | Uniswap V3 Router | `0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45` |
 
-## API utilisees
+## Sécurité
 
-| API | Usage | Auth |
-|-----|-------|------|
-| Gamma API | Decouverte des marches 5min | Aucune |
-| CLOB API | Placement des ordres | Signature wallet |
-| Binance WebSocket | Prix BTC en temps reel | Aucune |
-| Chainlink Oracle | Prix de reference (on-chain) | Aucune |
-| Polygon RPC | Transactions blockchain | Aucune |
+- Ne jamais partager la clé privée
+- Toujours `chmod 600 .env` après modification
+- `.env` est exclu de Git via `.gitignore`
+- Utiliser un wallet dédié (jamais le wallet principal)
+- Toutes les connexions utilisent TLS/SSL
 
 ## Avertissement
 
-Ce bot est un outil experimental. Le trading de marches de prediction comporte des risques financiers. Utilisez-le a vos propres risques et ne tradez que ce que vous pouvez vous permettre de perdre.
+Ce bot est un outil expérimental. Le trading de marchés de prédiction comporte des risques financiers. Utilisez-le à vos propres risques et ne tradez que ce que vous pouvez vous permettre de perdre.
