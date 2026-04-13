@@ -11,3 +11,19 @@ build/
 bot.log
 bot.pid
 .claude/
+
+# Clés et certificats
+*.key
+*.pem
+*.p12
+*.pfx
+
+# Données d'apprentissage (sauvegardées séparément via backup_learning_data.sh)
+learned_params.json
+trade_history.json
+profit_history.json
+
+# Rapports et tracking locaux
+cron_tracking/
+*.log
+logs/
