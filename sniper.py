@@ -7,6 +7,7 @@ from web3 import Web3
 from config import BotConfig
 from contracts.abis import CHAINLINK_AGGREGATOR_ABI
 from contracts.addresses import CHAINLINK_BTC_USD
+from learning_engine import LearningEngine, TradeRecord
 from logger import log
 from market_manager import MarketManager, compute_window_timestamp
 from models import MarketInfo
@@ -25,17 +26,19 @@ class Sniper:
         wallet_manager: WalletManager,
         clob_client=None,
         w3: Web3 | None = None,
+        learning_engine: LearningEngine | None = None,
     ):
         self._config = config
         self._mm = market_manager
         self._pa = price_analyzer
         self._wm = wallet_manager
         self._client = clob_client
+        self._le = learning_engine or LearningEngine()
         self._last_traded_window: int | None = None
         self._last_observed_window: int | None = None
         self._paper_trades: list[dict] = []
         self._chainlink_open_price: float | None = None
-        self._price_source: str = "none"  # "api", "binance", "chainlink"
+        self._price_source: str = "none"  # "api", "binance", "kraken", "chainlink"
 
         # Defensive: prevent any possibility of double-trade in the same window
         self._order_lock = asyncio.Lock()
@@ -52,6 +55,7 @@ class Sniper:
     async def run(self) -> None:
         mode = "PAPER" if self._config.paper_trading else "LIVE"
         log.info("Sniper (Process A) started [%s] — Composite Signal v5", mode)
+        log.info("LearningEngine: %s", self._le.summary())
         while True:
             try:
                 await self._process_one_window()
@@ -376,6 +380,19 @@ class Sniper:
             balance, share_price, net_yield * 100, signal.btc_distance,
             signal.signal_agreement, signal.signal_total,
         )
+
+        # Enregistrer le trade dans le learning engine
+        trade_record = TradeRecord(
+            window_ts=market.window_ts,
+            side=signal.recommended_side,
+            btc_distance=signal.btc_distance,
+            seconds_remaining=remaining,
+            confidence=signal.confidence,
+            share_price=share_price,
+            amount_usdc=bet_amount,
+            source="paper" if self._config.paper_trading else "live",
+        )
+        self._le.record_trade(trade_record)
 
         # Execute (guarded by lock to prevent double-trade)
         current_window = market.window_ts

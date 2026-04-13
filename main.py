@@ -20,6 +20,7 @@ import signal
 import sys
 
 from config import CHAIN_ID, CLOB_HOST, SIGNATURE_TYPE, BotConfig
+from learning_engine import LearningEngine
 from logger import log
 from market_manager import MarketManager
 from price_analyzer import PriceAnalyzer
@@ -30,6 +31,9 @@ from wallet_manager import WalletManager
 async def main() -> None:
     config = BotConfig.from_env()
 
+    # Learning engine partagé entre sniper et harvester
+    learning_engine = LearningEngine()
+
     if config.paper_trading:
         log.info("=" * 50)
         log.info("  MODE: PAPER TRADING (simulation)")
@@ -39,7 +43,8 @@ async def main() -> None:
         market_manager = MarketManager(config)
         price_analyzer = PriceAnalyzer(config)
         wallet_manager = WalletManager(config)
-        sniper = Sniper(config, market_manager, price_analyzer, wallet_manager)
+        sniper = Sniper(config, market_manager, price_analyzer, wallet_manager,
+                        learning_engine=learning_engine)
         w3 = None
         clob_client = None
     else:
@@ -90,7 +95,8 @@ async def main() -> None:
         market_manager = MarketManager(config)
         price_analyzer = PriceAnalyzer(config)
         wallet_manager = WalletManager(config, clob_client, w3)
-        sniper = Sniper(config, market_manager, price_analyzer, wallet_manager, clob_client, w3)
+        sniper = Sniper(config, market_manager, price_analyzer, wallet_manager,
+                        clob_client, w3, learning_engine=learning_engine)
 
     # Log balance
     balance = await wallet_manager.get_usdc_balance(force_refresh=True)
@@ -102,7 +108,8 @@ async def main() -> None:
     # Harvester only in live mode
     if not config.paper_trading and w3 is not None:
         from harvester import Harvester
-        harvester = Harvester(config, market_manager, wallet_manager, w3)
+        harvester = Harvester(config, market_manager, wallet_manager, w3,
+                              learning_engine=learning_engine)
         tasks_to_run.append(asyncio.create_task(harvester.run(), name="harvester"))
 
     # Graceful shutdown

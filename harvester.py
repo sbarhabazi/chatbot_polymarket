@@ -5,6 +5,7 @@ from web3 import Web3
 from config import BotConfig
 from contracts.abis import BALANCE_OF_ABI, REDEEM_POSITIONS_ABI
 from contracts.addresses import CTF, USDC_E
+from learning_engine import LearningEngine
 from logger import log
 from market_manager import MarketManager
 from models import MarketInfo
@@ -23,12 +24,14 @@ class Harvester:
         market_manager: MarketManager,
         wallet_manager: WalletManager,
         w3: Web3,
+        learning_engine: LearningEngine | None = None,
     ):
         self._config = config
         self._mm = market_manager
         self._wm = wallet_manager
         self._w3 = w3
         self._redeemed: set[str] = set()
+        self._le = learning_engine
 
         self._ctf_contract = w3.eth.contract(
             address=Web3.to_checksum_address(CTF),
@@ -62,11 +65,23 @@ class Harvester:
                 market.window_ts, market.condition_id[:16],
             )
 
+            # Récupérer le solde AVANT redeem pour calculer le payout
+            balance_before = await self._wm.get_usdc_balance(force_refresh=True)
+
             success = await self._redeem_position(market)
             if success:
                 self._redeemed.add(market.condition_id)
                 self._wm.invalidate_cache()
-                log.info("Redeemed successfully: window %d", market.window_ts)
+                balance_after = await self._wm.get_usdc_balance(force_refresh=True)
+                payout = max(0.0, balance_after - balance_before)
+                log.info("Redeemed successfully: window %d | payout=$%.2f",
+                         market.window_ts, payout)
+
+                # Enregistrer le résultat dans le learning engine
+                if self._le:
+                    won = payout > 0
+                    self._le.record_result(market.window_ts, won=won, payout=payout)
+                    log.info("LearningEngine updated: %s", self._le.summary())
             else:
                 log.warning("Redemption failed for window %d, will retry", market.window_ts)
 
