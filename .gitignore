@@ -27,3 +27,6 @@ profit_history.json
 cron_tracking/
 *.log
 logs/
+
+# Auto-ajouté par audit de sécurité
+*.env.*
