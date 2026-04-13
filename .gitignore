@@ -1,4 +1,5 @@
 .env
+.env.backup*
 __pycache__/
 *.pyc
 .venv/
@@ -7,3 +8,6 @@ venv/
 dist/
 build/
 .pytest_cache/
+bot.log
+bot.pid
+.claude/
