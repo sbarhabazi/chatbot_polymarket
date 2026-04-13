@@ -1,96 +1,50 @@
-# Polymarket BTC 5-min Sniper Bot
+# Polymarket BTC Sniper Bot
 
-Bot de trading automatique sur les marchés Polymarket "BTC Up/Down" en fenêtres de 5 minutes.
-
-## Infrastructure
-
-- **Déployé sur Vultr VPS** (Londres, GB) — actif 24h/24
-- **Source de prix** : Binance WS (principal) → Kraken WS → Coinbase WS → CoinGecko REST
-- **Blockchain** : Polygon (USDC.e)
-- **Supervision** : Perplexity Computer (toutes les 6h, auto-correction)
+Bot de trading automatique sur Polymarket — marchés BTC 5 minutes "Up or Down".
 
 ## Architecture
 
-```
-Process A — Sniper     : surveille BTC, signal composite v5, place ordres FOK
-Process B — Harvester  : réclame les positions gagnantes on-chain
-Process C — ProfitTaker: transfère $50 vers wallet personnel quand solde ≥ $100
-LearningEngine         : calibre automatiquement les seuils après chaque trade résolu
-```
+- **Process A (Sniper):** Surveille le prix BTC, calcule un signal composite (7 indicateurs), place des ordres FOK dans les dernières 120s de chaque fenêtre 5 min
+- **Process B (Harvester):** Réclame les positions gagnantes on-chain après résolution
+- **Process C (ProfitTaker):** Transfert automatique de $50 vers le portefeuille personnel quand la balance atteint $100
+- **LearningEngine:** Auto-calibration des seuils et du sizing après chaque trade résolu
 
-## Fichiers principaux
+## Infrastructure
 
-```
-main.py                  — orchestrateur
-config.py                — BotConfig, variables d'environnement
-models.py                — MarketInfo, PriceSnapshot, PriceSignal
-logger.py                — logging structuré
-market_manager.py        — découverte marchés via Gamma API
-price_analyzer.py        — source prix multi-fallback
-sniper.py                — Process A, signal composite v5
-harvester.py             — Process B, rachat on-chain
-wallet_manager.py        — solde USDC, Kelly sizing
-learning_engine.py       — calibration auto (learned_params.json, trade_history.json)
-profit_taker.py          — transfert auto vers wallet personnel
-monitor.py               — analyse logs, healthcheck
-optimizer.py             — ajustement paramètres (--apply)
-Dockerfile               — Python 3.11 slim, non-root
-scripts/                 — automatisations de maintenance
-```
+- **VPS:** Vultr Madrid (ES) — région autorisée par Polymarket
+- **Container:** Docker `polybot`
+- **Réseau:** Polygon (USDC.e)
 
-## Déploiement Vultr (actuel)
+## Variables d'environnement
+
+Voir `.env.example` pour la liste des variables requises.
+
+## Déploiement
 
 ```bash
-# Connexion au serveur (IP confidentielle — voir config privée)
-ssh root@<VPS_IP>
-
-# Logs en direct
-docker logs polybot -f
-
-# Redémarrage manuel
-docker restart polybot
-
-# Mise à jour depuis GitHub
-cd /opt/polybot/chatbot_polymarket
-git pull
+# Construire et lancer
 docker build -t polybot:latest .
-docker stop polybot && docker rm polybot
-docker run -d --name polybot --restart unless-stopped \
-  --env-file .env \
+docker run -d --name polybot --restart unless-stopped --env-file .env \
   -v /opt/polybot/data:/app/data \
   --log-driver json-file --log-opt max-size=50m \
   polybot:latest
+
+# Logs
+docker logs polybot -f
 ```
 
-## Variables d'environnement (.env sur le serveur)
+## Supervision
 
-| Variable | Description |
-|---|---|
-| `PAPER_TRADING` | `false` (live) |
-| `PRIVATE_KEY` | Clé privée wallet Polygon |
-| `WALLET_ADDRESS` | Wallet de trading |
-| `PERSONAL_WALLET` | Wallet de destination (profit) |
-| `POLYGON_RPC_URL` | RPC Polygon |
-| `MIN_BET_AMOUNT` | Mise minimale ($3.0) |
-| `PROFIT_TRIGGER_BALANCE` | Déclenchement transfert ($100) |
-| `PROFIT_TRANSFER_AMOUNT` | Montant transféré ($50) |
+8 crons automatiques gèrent:
+- Supervision toutes les 6h (auto-fix si nécessaire)
+- Alertes capital critique (toutes les heures)
+- Sauvegarde learning data (quotidienne)
+- Rapports hebdomadaires et mensuels
+- Audit de sécurité hebdomadaire
+- Détection Polymarket down
 
-## Automatisations (Perplexity Computer)
+## Notes importantes
 
-| Tâche | Fréquence |
-|---|---|
-| Supervision + auto-fix | Toutes les 6h |
-| Alerte capital critique | Toutes les heures |
-| Détection Polymarket down | Toutes les 6h |
-| Auto-optimisation + check POL | Toutes les 6h |
-| Sauvegarde données apprentissage | Chaque jour 23h EDT |
-| Rapport hebdomadaire | Lundi 8h EDT |
-| Audit sécurité | Dimanche 23h EDT |
-| Rapport mensuel | 1er du mois 8h EDT |
-
-## Wallets
-
-- Trading : `0x0f6768A0ff895433827531f83933D805CF979B02`
-- Personnel : `0x18f390858565B76c395b983531C659fAf67E4De8`
-- Réseau : Polygon (chain 137)
-- Token : USDC.e (`0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174`)
+- GB (Royaume-Uni), FR (France), DE (Allemagne), NL (Pays-Bas) sont **bloqués** par Polymarket
+- ES (Espagne) est **autorisé** — VPS Madrid utilisé
+- Ne jamais utiliser de VPN (interdit par Polymarket)
