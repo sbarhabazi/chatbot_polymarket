@@ -41,8 +41,8 @@ scripts/                 — automatisations de maintenance
 ## Déploiement Vultr (actuel)
 
 ```bash
-# Connexion au serveur
-ssh root@45.76.130.234
+# Connexion au serveur (IP confidentielle — voir config privée)
+ssh root@<VPS_IP>
 
 # Logs en direct
 docker logs polybot -f
