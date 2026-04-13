@@ -88,13 +88,13 @@ class Sniper:
                 log.info("Window %d priceToBeat=$%.2f (VERIFIED from API, %.0fs left)",
                          current_window, prev_final, remaining)
             else:
-                # Priority 2: Binance real-time price (approximation)
-                binance_price = self._pa.get_current_price()
-                if binance_price:
-                    self._chainlink_open_price = binance_price
-                    self._price_source = "binance"
-                    log.warning("Window %d Binance BTC: $%.2f (APPROX — prev not resolved yet, %.0fs left)",
-                                current_window, binance_price, remaining)
+                # Priority 2: Real-time price from active source (Binance/Kraken/Coinbase)
+                live_price = self._pa.get_current_price()
+                if live_price:
+                    self._chainlink_open_price = live_price
+                    self._price_source = self._pa._active_source.lower().split()[0]  # "binance", "kraken", "coinbase"
+                    log.warning("Window %d %s BTC: $%.2f (APPROX — prev not resolved yet, %.0fs left)",
+                                current_window, self._pa._active_source, live_price, remaining)
                 else:
                     # Priority 3: Chainlink (least accurate)
                     self._chainlink_open_price = self._get_chainlink_price()
@@ -224,12 +224,12 @@ class Sniper:
                     log.info("UPGRADED to verified priceToBeat=$%.2f", ptb)
                 else:
                     # Use approximate price if distance exceeds safety margin for the source.
-                    # Binance at window open ≈ real priceToBeat within $5-20 (same moment, different source)
+                    # Binance/Kraken at window open ≈ real priceToBeat within $5-20
                     # Chainlink on-chain can lag by $50-80 vs Polymarket's resolution price
                     btc_now = self._pa.get_current_price()
                     if btc_now:
                         approx_dist = abs(btc_now - self._chainlink_open_price)
-                        safety = 25 if self._price_source == "binance" else 80
+                        safety = 25 if self._price_source in ("binance", "kraken") else 80
                         if approx_dist > safety:
                             ptb = self._chainlink_open_price
                             if verbose:
@@ -242,6 +242,16 @@ class Sniper:
                             return False
                     else:
                         return False
+
+        # Paper trading: if still no priceToBeat, use current BTC price as approximation
+        if ptb is None and self._config.paper_trading:
+            btc_now = self._pa.get_current_price()
+            if btc_now:
+                ptb = btc_now
+                self._chainlink_open_price = btc_now
+                self._price_source = "approx"
+                if verbose:
+                    log.info("PAPER: using current BTC=$%.2f as priceToBeat (approx)", ptb)
 
         if ptb is None:
             if verbose:
