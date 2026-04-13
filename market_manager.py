@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 import ssl
 import time
@@ -39,6 +41,55 @@ class MarketManager:
     async def get_current_market(self) -> MarketInfo | None:
         window_ts = compute_window_timestamp()
         return await self.get_market_by_window_ts(window_ts)
+
+    async def get_previous_final_price(self, current_window_ts: int) -> float | None:
+        """Get the finalPrice from the previous resolved window.
+
+        In Polymarket 5-min BTC markets, priceToBeat of window N = finalPrice of window N-1.
+        This is only available after the previous window resolves (usually within ~2 minutes).
+        """
+        prev_ts = current_window_ts - MARKET_INTERVAL_SECONDS
+        market = await self.get_market_by_window_ts(prev_ts)
+        if market is None:
+            return None
+
+        # Re-fetch to get the eventMetadata with finalPrice
+        slug = build_slug(prev_ts)
+        url = f"{GAMMA_API_BASE}/events?slug={slug}"
+        session = await self._get_session()
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+                if not data:
+                    return None
+
+                event = data[0]
+                metadata = event.get("eventMetadata", {})
+                if isinstance(metadata, str):
+                    import json as _json
+                    try:
+                        metadata = _json.loads(metadata)
+                    except (json.JSONDecodeError, TypeError):
+                        return None
+
+                ptb = metadata.get("priceToBeat")
+                final = metadata.get("finalPrice")
+
+                # CRITICAL: priceToBeat(N) = finalPrice(N-1)
+                # Only return finalPrice — priceToBeat of prev window is the WRONG value!
+                # (priceToBeat = opening price, finalPrice = closing price)
+                if final is not None:
+                    log.info("Prev window %d resolved: finalPrice=$%.2f (ptb=$%.2f)",
+                             prev_ts, float(final), float(ptb) if ptb else 0)
+                    return float(final)
+                # Not resolved yet — return None, caller will use Binance fallback
+                return None
+        except Exception as e:
+            log.debug("Failed to get previous finalPrice: %s", e)
+
+        return None
 
     async def get_market_by_window_ts(self, window_ts: int) -> MarketInfo | None:
         slug = build_slug(window_ts)

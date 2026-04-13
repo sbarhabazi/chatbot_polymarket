@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from web3 import Web3
 
 from config import BotConfig
@@ -27,6 +29,56 @@ def calculate_net_yield(share_price: float, fee_rate: float = 0.072) -> float:
     profit = 1.0 - share_price
     fee = fee_rate * profit
     return (profit - fee) / share_price
+
+
+def compute_kelly_size(
+    confidence: float,
+    share_price: float,
+    kelly_fraction: float = 0.25,
+    fee_rate: float = 0.072,
+) -> float:
+    """
+    Fractional Kelly criterion for optimal position sizing.
+
+    Full Kelly: f* = (p*b - q) / b
+      where p = P(win), q = 1-p, b = net payout odds
+
+    We use fractional Kelly (default quarter-Kelly) for safety.
+    Quarter-Kelly captures ~75% of growth rate with dramatically lower variance.
+
+    Returns: fraction of bankroll to bet (0.0 if EV is negative).
+
+    Examples at quarter-Kelly:
+      conf=0.65, price=$0.55 → 4.7% of bankroll
+      conf=0.80, price=$0.55 → 13.4% of bankroll
+      conf=0.55, price=$0.55 → 0% (EV negative after fees)
+      conf=0.85, price=$0.80 → 5.2% of bankroll
+    """
+    if confidence <= 0 or confidence >= 1:
+        return 0.0
+    if share_price <= 0 or share_price >= 1:
+        return 0.0
+
+    p = confidence
+    q = 1.0 - p
+
+    # Net payout per $1 risked
+    profit_per_share = 1.0 - share_price
+    fee = fee_rate * profit_per_share
+    net_profit = profit_per_share - fee
+    b = net_profit / share_price  # Net odds
+
+    if b <= 0:
+        return 0.0
+
+    # Full Kelly
+    f_full = (p * b - q) / b
+
+    if f_full <= 0:
+        return 0.0  # Expected value is negative — don't bet
+
+    # Fractional Kelly
+    return f_full * kelly_fraction
 
 
 class WalletManager:

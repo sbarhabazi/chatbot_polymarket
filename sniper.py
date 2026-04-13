@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 
 from web3 import Web3
@@ -9,11 +11,11 @@ from logger import log
 from market_manager import MarketManager, compute_window_timestamp
 from models import MarketInfo
 from price_analyzer import PriceAnalyzer
-from wallet_manager import WalletManager, calculate_net_yield
+from wallet_manager import WalletManager, calculate_net_yield, compute_kelly_size
 
 
 class Sniper:
-    """Process A: Distance-based Safe Scalper."""
+    """Process A: Composite Signal Scalper v5 (OBI + Kelly)."""
 
     def __init__(
         self,
@@ -33,6 +35,11 @@ class Sniper:
         self._last_observed_window: int | None = None
         self._paper_trades: list[dict] = []
         self._chainlink_open_price: float | None = None
+        self._price_source: str = "none"  # "api", "binance", "chainlink"
+
+        # Defensive: prevent any possibility of double-trade in the same window
+        self._order_lock = asyncio.Lock()
+        self._order_pending_window: int | None = None
 
         # Chainlink oracle (same source Polymarket uses for resolution)
         self._chainlink = None
@@ -44,7 +51,7 @@ class Sniper:
 
     async def run(self) -> None:
         mode = "PAPER" if self._config.paper_trading else "LIVE"
-        log.info("Sniper (Process A) started [%s] — Safe Scalper v2", mode)
+        log.info("Sniper (Process A) started [%s] — Composite Signal v5", mode)
         while True:
             try:
                 await self._process_one_window()
@@ -71,30 +78,67 @@ class Sniper:
             await asyncio.sleep(1)
             return
 
-        # Capture Chainlink BTC price on first observation of new window
+        # Capture reference BTC price on first observation of new window
         if self._last_observed_window != current_window:
-            self._chainlink_open_price = self._get_chainlink_price()
+            # Priority 1: Previous window's finalPrice (= current window's real priceToBeat)
+            prev_final = await self._mm.get_previous_final_price(current_window)
+            if prev_final:
+                self._chainlink_open_price = prev_final
+                self._price_source = "api"
+                log.info("Window %d priceToBeat=$%.2f (VERIFIED from API, %.0fs left)",
+                         current_window, prev_final, remaining)
+            else:
+                # Priority 2: Binance real-time price (approximation)
+                binance_price = self._pa.get_current_price()
+                if binance_price:
+                    self._chainlink_open_price = binance_price
+                    self._price_source = "binance"
+                    log.warning("Window %d Binance BTC: $%.2f (APPROX — prev not resolved yet, %.0fs left)",
+                                current_window, binance_price, remaining)
+                else:
+                    # Priority 3: Chainlink (least accurate)
+                    self._chainlink_open_price = self._get_chainlink_price()
+                    self._price_source = "chainlink"
+                    if self._chainlink_open_price:
+                        log.warning("Window %d Chainlink: $%.2f (LEAST RELIABLE, %.0fs left)",
+                                    current_window, self._chainlink_open_price, remaining)
+
+            # Paper mode fallback
+            if self._chainlink_open_price is None and self._config.paper_trading:
+                self._chainlink_open_price = self._pa.get_current_price()
+                self._price_source = "binance"
+
             self._last_observed_window = current_window
-            if self._chainlink_open_price:
-                log.info("Window %d Chainlink BTC: $%.2f (%.0fs left)",
-                         current_window, self._chainlink_open_price, remaining)
 
         # Observation phase
         if not self._mm.is_in_entry_window(market):
             btc = self._pa.get_current_price()
             btc_str = f"${btc:,.2f}" if btc else "N/A"
 
-            # Try to get price_to_beat (check API every ~60s, not every 5s)
+            # Try to upgrade priceToBeat from API or previous window (every ~30s)
             ptb = market.price_to_beat
-            if ptb is None and int(remaining) % 60 < 6:
+            if ptb is None and int(remaining) % 30 < 6:
                 refreshed = await self._mm.get_market_by_window_ts(market.window_ts)
                 if refreshed and refreshed.price_to_beat:
                     ptb = refreshed.price_to_beat
 
-            ptb_str = f"beat=${ptb:,.2f}" if ptb else "beat=N/A"
+            # Keep trying to upgrade to VERIFIED price if we only have an approximation
+            if ptb is None and self._price_source != "api" and int(remaining) % 15 < 6:
+                prev_final = await self._mm.get_previous_final_price(current_window)
+                if prev_final:
+                    old = self._chainlink_open_price
+                    self._chainlink_open_price = prev_final
+                    self._price_source = "api"
+                    diff = prev_final - old if old else 0
+                    log.info("UPGRADED priceToBeat=$%.2f (VERIFIED, was $%.2f, diff=$%.1f)",
+                             prev_final, old or 0, diff)
+
+            # Display beat from best available source
+            beat = ptb or (self._chainlink_open_price if self._chainlink_open_price else None)
+            ptb_str = f"beat=${beat:,.2f}" if beat else "beat=N/A"
             dist = ""
-            if btc and ptb:
-                d = btc - float(ptb)
+            if btc and beat:
+                d = btc - float(beat)
                 dist = f"dist=${d:+.1f}"
 
             log.info(
@@ -105,22 +149,57 @@ class Sniper:
             await asyncio.sleep(5)
             return
 
-        # Entry window
-        await self._attempt_entry(market)
+        # Entry window — scan continuously until trade or window closes
+        traded = await self._scan_entry_window(market)
+        # Mark window as traded (defensive: _attempt_entry already sets this on success,
+        # but we also set it here to prevent re-entry even if no trade was placed)
         self._last_traded_window = current_window
+        self._order_pending_window = None
         self._window_open_price = None  # Reset for next window
 
         remaining = max(0, self._mm.seconds_remaining(market))
-        log.info("Sleeping %.0fs until market close", remaining)
+        if traded:
+            log.info("Trade placed, waiting %.0fs for market close", remaining)
+        else:
+            log.info("No trade this window, %.0fs until close", remaining)
         await asyncio.sleep(remaining + 2)
 
-    async def _attempt_entry(self, market: MarketInfo) -> None:
+    async def _scan_entry_window(self, market: MarketInfo) -> bool:
+        """Continuously scan for entry opportunity during the entry window.
+
+        Instead of checking once, scans every 5s until:
+        - A trade is executed (return True)
+        - The window closes (return False)
+        """
+        scan_count = 0
+        while True:
+            remaining = self._mm.seconds_remaining(market)
+            if remaining <= 2:
+                break
+
+            result = await self._attempt_entry(market, scan_count)
+            if result:
+                return True  # Trade executed
+
+            scan_count += 1
+            # Wait 5s before next scan (but not if window is about to close)
+            wait = min(5, max(1, remaining - 2))
+            await asyncio.sleep(wait)
+
+        return False
+
+    async def _attempt_entry(self, market: MarketInfo, scan_count: int = 0) -> bool:
+        """Attempt entry. Returns True if trade was placed, False otherwise."""
         remaining = self._mm.seconds_remaining(market)
-        log.info(
-            "=== ENTRY WINDOW [%s] === %.0fs remaining | window %d",
-            "EARLY" if remaining > 60 else "LATE",
-            remaining, market.window_ts,
-        )
+        phase = "EARLY" if remaining > 60 else "LATE"
+
+        if scan_count == 0:
+            log.info(
+                "=== ENTRY WINDOW [%s] === %.0fs remaining | window %d | SCANNING",
+                phase, remaining, market.window_ts,
+            )
+        # Log every 3rd scan to avoid spam (or always for first scan)
+        verbose = (scan_count == 0) or (scan_count % 3 == 0)
 
         # Check 1: price_to_beat available?
         # Priority: Polymarket API > Chainlink oracle
@@ -131,19 +210,51 @@ class Sniper:
                 ptb = refreshed.price_to_beat
 
         if ptb is None and self._chainlink_open_price:
-            ptb = self._chainlink_open_price
-            log.info("Using Chainlink oracle price: $%.2f", ptb)
+            if self._price_source == "api":
+                ptb = self._chainlink_open_price
+                if verbose:
+                    log.info("Using VERIFIED priceToBeat: $%.2f", ptb)
+            else:
+                # Try to upgrade to verified price first
+                prev_final = await self._mm.get_previous_final_price(market.window_ts)
+                if prev_final:
+                    self._chainlink_open_price = prev_final
+                    self._price_source = "api"
+                    ptb = prev_final
+                    log.info("UPGRADED to verified priceToBeat=$%.2f", ptb)
+                else:
+                    # Use approximate price if distance exceeds safety margin for the source.
+                    # Binance at window open ≈ real priceToBeat within $5-20 (same moment, different source)
+                    # Chainlink on-chain can lag by $50-80 vs Polymarket's resolution price
+                    btc_now = self._pa.get_current_price()
+                    if btc_now:
+                        approx_dist = abs(btc_now - self._chainlink_open_price)
+                        safety = 25 if self._price_source == "binance" else 80
+                        if approx_dist > safety:
+                            ptb = self._chainlink_open_price
+                            if verbose:
+                                log.info("Using APPROX %s=$%.2f (dist=$%.0f > $%d safety)",
+                                         self._price_source, ptb, approx_dist, safety)
+                        else:
+                            if verbose:
+                                log.info("WAIT: price not verified (%s), dist=$%.0f < $%d safety",
+                                         self._price_source, approx_dist, safety)
+                            return False
+                    else:
+                        return False
 
         if ptb is None:
-            log.info("SKIP: no priceToBeat (API or Chainlink)")
-            return
+            if verbose:
+                log.info("SKIP: no priceToBeat available")
+            return False
 
         price_to_beat = float(ptb)
 
         # Check 2: PriceAnalyzer connected?
         if not self._pa.is_connected:
-            log.warning("SKIP: PriceAnalyzer not connected")
-            return
+            if verbose:
+                log.warning("SKIP: PriceAnalyzer not connected")
+            return False
 
         # Check 3: Compute distance signal
         signal = self._pa.compute_distance_signal(
@@ -151,31 +262,35 @@ class Sniper:
             seconds_remaining=remaining,
         )
         if signal is None:
-            log.warning("SKIP: Insufficient price data")
-            return
+            if verbose:
+                log.warning("SKIP: Insufficient price data")
+            return False
 
-        log.info(
-            "Signal: %s | BTC=$%.2f | beat=$%.2f | dist=$%.1f | "
-            "conf=%.2f | mom=[%.1f,%.1f,%.1f] agree=%d/3 | vol=%.5f | bvr=%.2f",
-            signal.recommended_side, signal.current_price, signal.price_to_beat,
-            signal.btc_distance, signal.confidence,
-            signal.momentum_10s, signal.momentum_30s, signal.momentum_60s,
-            signal.momentum_agreement,
-            signal.volatility_30s, signal.buy_volume_ratio,
-        )
+        if verbose:
+            log.info(
+                "Scan #%d [%s] %.0fs | %s dist=$%.1f | conf=%.2f (base=%.2f) | "
+                "OBI=%+.2f | RSI=%.0f | signals=%d/%d",
+                scan_count, phase, remaining,
+                signal.recommended_side, signal.btc_distance,
+                signal.confidence, signal.distance_confidence,
+                signal.obi, signal.rsi,
+                signal.signal_agreement, signal.signal_total,
+            )
 
         # Check 4: Signal rejected?
         if signal.skip_reason:
-            log.info("SKIP: %s", signal.skip_reason)
-            return
+            if verbose:
+                log.info("  → SKIP: %s", signal.skip_reason)
+            return False
 
         # Check 5: Confidence threshold
         if signal.confidence < self._config.medium_confidence_threshold:
-            log.info(
-                "SKIP: Confidence %.2f < minimum %.2f",
-                signal.confidence, self._config.medium_confidence_threshold,
-            )
-            return
+            if verbose:
+                log.info(
+                    "  → conf %.2f < %.2f, waiting...",
+                    signal.confidence, self._config.medium_confidence_threshold,
+                )
+            return False
 
         # Determine token and price
         if signal.recommended_side == "Up":
@@ -198,123 +313,228 @@ class Sniper:
         # Check 6: Price acceptable?
         if not WalletManager.yield_acceptable(share_price, self._config.max_buy_price):
             log.info("SKIP: Price $%.3f > max $%.2f", share_price, self._config.max_buy_price)
-            return
+            return False
 
         if WalletManager.yield_too_low(share_price, self._config.abort_price):
             log.warning("ABORT: Price $%.3f >= abort $%.2f", share_price, self._config.abort_price)
-            return
+            return False
 
         # Check 7: Liquidity
         if market.liquidity < self._config.min_market_liquidity:
             log.warning("SKIP: Liquidity $%.0f < min", market.liquidity)
-            return
+            return False
 
-        # Check 8: Confidence-based position sizing
+        # Check 8: Kelly-based position sizing
         balance = await self._wm.get_usdc_balance(force_refresh=True)
 
-        if signal.confidence >= self._config.high_confidence_threshold:
-            size_fraction = self._config.high_confidence_size
-            tier = "HIGH"
-        else:
-            size_fraction = self._config.medium_confidence_size
-            tier = "MEDIUM"
-
-        bet_amount = round(balance * size_fraction, 2)
-        if bet_amount < 5.0:
-            log.warning("SKIP: Bet $%.2f < $5 min (balance=$%.2f)", bet_amount, balance)
-            return
-
-        log.info(
-            "BUY [%s]: %s | $%.2f (%.0f%% of $%.2f) @ $%.3f | yield=%.1f%% | dist=$%.1f",
-            tier, signal.recommended_side, bet_amount, size_fraction * 100,
-            balance, share_price, net_yield * 100, signal.btc_distance,
+        kelly_size = compute_kelly_size(
+            confidence=signal.confidence,
+            share_price=share_price,
+            kelly_fraction=self._config.kelly_fraction,
         )
 
-        # Execute
-        if self._config.paper_trading:
-            shares = bet_amount / share_price
-            trade = {
-                "window": market.window_ts,
-                "side": signal.recommended_side,
-                "price": share_price,
-                "amount": bet_amount,
-                "shares": shares,
-                "potential_payout": shares * 1.0,
-                "btc_price": signal.current_price,
-                "btc_distance": signal.btc_distance,
-                "confidence": signal.confidence,
-                "tier": tier,
-            }
-            self._paper_trades.append(trade)
-            self._wm.paper_deduct(bet_amount)
+        if kelly_size <= 0:
             log.info(
-                "PAPER BUY OK: %.1f shares @ $%.3f | payout=$%.2f | trades=%d | bal=$%.2f",
-                shares, share_price, shares, len(self._paper_trades),
-                await self._wm.get_usdc_balance(),
+                "SKIP: Kelly says no bet (EV negative at conf=%.2f, price=$%.2f)",
+                signal.confidence, share_price,
             )
+            return False
+
+        # Cap Kelly size
+        size_fraction = min(kelly_size, self._config.max_kelly_size)
+
+        # Determine tier for logging
+        if signal.confidence >= self._config.high_confidence_threshold:
+            tier = "HIGH"
+        elif signal.confidence >= self._config.medium_confidence_threshold:
+            tier = "MEDIUM"
         else:
-            success = await self._place_limit_buy(token_id, bet_amount, share_price)
-            if success:
-                self._wm.invalidate_cache()
-                log.info("BUY FILLED at $%.2f (real yield: %.1f%%)", share_price, net_yield * 100)
+            tier = "LOW"
+
+        bet_amount = round(balance * size_fraction, 2)
+        if bet_amount < self._config.min_bet_amount:
+            log.warning(
+                "SKIP: Bet $%.2f < $%.0f min (balance=$%.2f, kelly=%.1f%%)",
+                bet_amount, self._config.min_bet_amount, balance, kelly_size * 100,
+            )
+            return False
+
+        log.info(
+            "BUY [%s]: %s | $%.2f (kelly=%.1f%% of $%.2f) @ $%.3f | "
+            "yield=%.1f%% | dist=$%.1f | signals=%d/%d",
+            tier, signal.recommended_side, bet_amount, size_fraction * 100,
+            balance, share_price, net_yield * 100, signal.btc_distance,
+            signal.signal_agreement, signal.signal_total,
+        )
+
+        # Execute (guarded by lock to prevent double-trade)
+        current_window = market.window_ts
+        if self._order_pending_window == current_window:
+            log.info("SKIP: order already pending for window %d", current_window)
+            return False
+
+        async with self._order_lock:
+            # Re-check after acquiring lock
+            if self._last_traded_window == compute_window_timestamp():
+                log.info("SKIP: window already traded (caught by lock)")
+                return False
+
+            if self._order_pending_window == current_window:
+                log.info("SKIP: order already pending for window %d", current_window)
+                return False
+
+            self._order_pending_window = current_window
+
+            if self._config.paper_trading:
+                shares = bet_amount / share_price
+                trade = {
+                    "window": market.window_ts,
+                    "side": signal.recommended_side,
+                    "price": share_price,
+                    "amount": bet_amount,
+                    "shares": shares,
+                    "potential_payout": shares * 1.0,
+                    "btc_price": signal.current_price,
+                    "btc_distance": signal.btc_distance,
+                    "confidence": signal.confidence,
+                    "tier": tier,
+                }
+                self._paper_trades.append(trade)
+                self._wm.paper_deduct(bet_amount)
+                self._last_traded_window = compute_window_timestamp()
+                log.info(
+                    "PAPER BUY OK: %.1f shares @ $%.3f | payout=$%.2f | trades=%d | bal=$%.2f",
+                    shares, share_price, shares, len(self._paper_trades),
+                    await self._wm.get_usdc_balance(),
+                )
+                return True
             else:
-                log.warning("BUY NOT FILLED (no sellers at $%.2f)", share_price)
+                success = await self._place_limit_buy(token_id, bet_amount, share_price, signal.confidence)
+                if success:
+                    self._last_traded_window = compute_window_timestamp()
+                    self._wm.invalidate_cache()
+                    log.info(
+                        "ORDER ACCEPTED (scan #%d) | %s @ $%.3f | yield=%.1f%%",
+                        scan_count, signal.recommended_side, share_price, net_yield * 100,
+                    )
+                    return True
+                else:
+                    self._order_pending_window = None
+                    log.warning("Order failed at scan #%d", scan_count)
+                    return False
 
-    async def _place_limit_buy(self, token_id: str, amount_usdc: float, price: float) -> bool:
-        """Place a LIMIT buy order at the specified price.
+    async def _place_limit_buy(self, token_id: str, amount_usdc: float, price: float, confidence: float = 0.65) -> bool:
+        """Place a buy order with dynamic fill buffer based on confidence.
 
-        Unlike market orders that eat the entire order book (causing massive slippage),
-        limit orders only fill at the specified price or better.
+        Higher confidence → more aggressive pricing (willing to pay more for fills).
+        At conf=0.60: offer = market + base_buffer
+        At conf=0.85: offer = market + base_buffer + 0.075 (confidence bonus)
 
         Args:
             token_id: The Polymarket token ID
             amount_usdc: USDC to spend
-            price: Max price per share (e.g. 0.55 = $0.55/share)
+            price: Market price per share (e.g. 0.50 = $0.50/share)
+            confidence: Signal confidence (0-1), used to scale the fill buffer
         """
         try:
             from py_clob_client.clob_types import OrderArgs, OrderType
             from py_clob_client.order_builder.constants import BUY
+            import math
 
-            # Calculate number of shares: amount_usdc / price
-            # Polymarket requires: price = 2 decimals, size = whole number
-            price = round(price, 2)
-            size = int(amount_usdc / price)  # Floor to whole shares
+            base_buffer = self._config.fill_buffer
+            order_type_str = self._config.order_type
+
+            # Map string to OrderType enum
+            order_type_map = {
+                "FOK": OrderType.FOK,
+                "GTC": OrderType.GTC,
+                "GTD": OrderType.GTD,
+                "FAK": OrderType.FAK,
+            }
+            order_type = order_type_map.get(order_type_str, OrderType.FOK)
+
+            # Dynamic buffer: higher confidence → willing to pay more for fills
+            # At 50/50 market ($0.50), static $0.10-0.15 buffer gets no fills
+            # because sellers hold shares worth $0.80+ at high confidence
+            confidence_bonus = max(0, (confidence - 0.60)) * 0.30
+            fill_buffer = base_buffer + confidence_bonus
+            offer_price = min(math.ceil((price + fill_buffer) * 100) / 100, 0.95)
+            size = int(amount_usdc / offer_price)  # Floor to whole shares
 
             if size < 1:
-                log.warning("Order size too small: %d shares", size)
+                log.warning("Order size too small: %d shares at $%.2f", size, offer_price)
                 return False
 
             log.info(
-                "LIMIT ORDER: %d shares @ $%.2f = $%.2f",
-                size, price, size * price,
+                "%s ORDER: %d shares @ $%.2f (market=$%.2f +$%.2f buf [base=$%.2f +conf=$%.2f]) = $%.2f",
+                order_type_str, size, offer_price, price, fill_buffer,
+                base_buffer, confidence_bonus, size * offer_price,
             )
 
             order_args = OrderArgs(
                 token_id=token_id,
-                price=price,
+                price=offer_price,
                 size=size,
                 side=BUY,
             )
             signed_order = self._client.create_order(order_args)
-            # GTC: order stays in book, partial fills OK. Market close auto-cancels unfilled.
-            response = self._client.post_order(signed_order, OrderType.GTC)
+            response = self._client.post_order(signed_order, order_type)
 
             if isinstance(response, dict):
                 status = response.get("status", "")
+                taking = response.get("takingAmount", "0")
+                making = response.get("makingAmount", "0")
+                order_id = response.get("orderID", response.get("id", "?"))
+
+                log.info("Order response: status=%s taking=%s making=%s id=%s",
+                         status, taking, making, order_id)
+
                 if status == "matched":
-                    taking = response.get("takingAmount", "?")
-                    making = response.get("makingAmount", "?")
-                    log.info("LIMIT FILLED: paid $%s for %s shares", making, taking)
+                    log.info(
+                        "%s FILLED: paid $%s for %s shares (offered $%.2f)",
+                        order_type_str, making, taking, offer_price,
+                    )
                     return True
+                elif status == "live":
+                    # GTC: order is in the book, waiting for sellers.
+                    # IMPORTANT: Return True to STOP the scanning loop.
+                    # The order will sit in the book and may fill before window close.
+                    # Returning False would cause the scan loop to stack more GTC orders!
+                    try:
+                        filled = float(taking) if taking else 0
+                    except (ValueError, TypeError):
+                        filled = 0
+                    if filled > 0:
+                        log.info(
+                            "%s PARTIAL FILL: %s shares filled, rest in book @ $%.2f",
+                            order_type_str, taking, offer_price,
+                        )
+                    else:
+                        log.info(
+                            "%s order PLACED in book @ $%.2f (waiting for sellers, may fill before close)",
+                            order_type_str, offer_price,
+                        )
+                    return True  # Stop scanning — order is live in the book
                 else:
-                    log.warning("Limit order not filled: %s (no sellers at $%.2f)", status, price)
+                    log.warning(
+                        "%s order status=%s at $%.2f (full response: %s)",
+                        order_type_str, status, offer_price, response,
+                    )
                     return False
 
-            log.info("Order response: %s", response)
+            log.info("Order response (raw): %s", response)
             return True
         except Exception as e:
-            log.error("Order execution error: %s", e, exc_info=True)
-            return False
+            err_msg = str(e)
+            if "fully filled" in err_msg and "FOK" in err_msg:
+                log.warning("FOK rejected (partial fill available, not enough for full order)")
+                return False
+            elif "not enough balance" in err_msg:
+                log.warning("Insufficient balance for order (USDC locked in active orders)")
+                return True  # Stop scanning — no point retrying with same balance
+            else:
+                log.error("Order execution error: %s", e, exc_info=True)
+                return False
 
     def _get_chainlink_price(self) -> float | None:
         """Get BTC/USD price from Chainlink oracle (same source as Polymarket resolution)."""

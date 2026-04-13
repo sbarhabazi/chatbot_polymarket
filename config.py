@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 from dataclasses import dataclass
 from dotenv import load_dotenv
@@ -10,6 +12,7 @@ CHAIN_ID = 137
 SIGNATURE_TYPE = 0
 MARKET_INTERVAL_SECONDS = 300
 BINANCE_WS_URL = "wss://stream.binance.com:9443/ws/btcusdt@trade"
+BINANCE_DEPTH_WS_URL = "wss://stream.binance.com:9443/ws/btcusdt@depth20@100ms"
 
 
 @dataclass(frozen=True)
@@ -35,6 +38,15 @@ class BotConfig:
     high_confidence_size: float
     medium_confidence_size: float
     position_size_fraction: float  # fallback
+
+    # Order execution
+    fill_buffer: float
+    order_type: str  # "FOK", "GTC", "FAK"
+
+    # Kelly sizing
+    kelly_fraction: float
+    max_kelly_size: float
+    min_bet_amount: float
 
     # Harvester
     harvest_poll_interval: int
@@ -73,6 +85,11 @@ class BotConfig:
             high_confidence_size=float(os.environ.get("HIGH_CONFIDENCE_SIZE", "0.30")),
             medium_confidence_size=float(os.environ.get("MEDIUM_CONFIDENCE_SIZE", "0.20")),
             position_size_fraction=float(os.environ.get("POSITION_SIZE_FRACTION", "0.40")),
+            fill_buffer=float(os.environ.get("FILL_BUFFER", "0.10")),
+            order_type=os.environ.get("ORDER_TYPE", "FOK").upper(),
+            kelly_fraction=float(os.environ.get("KELLY_FRACTION", "0.50")),
+            max_kelly_size=float(os.environ.get("MAX_KELLY_SIZE", "0.20")),
+            min_bet_amount=float(os.environ.get("MIN_BET_AMOUNT", "5.0")),
             harvest_poll_interval=int(os.environ.get("HARVEST_POLL_INTERVAL", "30")),
             max_recent_markets=int(os.environ.get("MAX_RECENT_MARKETS_TO_CHECK", "20")),
             paper_trading=paper,

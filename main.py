@@ -66,7 +66,7 @@ async def main() -> None:
         usdc_e_bal = get_usdc_e_balance(w3, wallet) / 1e6
         log.info("USDC.e: $%.2f | USDC native: $%.2f", usdc_e_bal, native_bal)
 
-        if native_bal > 1.0 and usdc_e_bal < 15.0:
+        if native_bal > 1.0:
             log.info("Auto-swapping USDC native -> USDC.e...")
             success = swap_native_usdc_to_usdc_e(w3, config.private_key, wallet)
             if success:
@@ -119,12 +119,15 @@ async def main() -> None:
     await price_analyzer.start()
 
     log.info("=" * 50)
-    log.info("POLYMARKET 5-MIN BTC SNIPER BOT RUNNING")
-    log.info("  Position size: %.0f%% of balance", config.position_size_fraction * 100)
+    log.info("POLYMARKET 5-MIN BTC SNIPER BOT v5 RUNNING")
+    log.info("  Sizing: Kelly (fraction=%.0f%%, max=%.0f%%)",
+             config.kelly_fraction * 100, config.max_kelly_size * 100)
     log.info("  Max buy price: $%.2f (min yield ~%.0f%%)",
              config.max_buy_price,
              ((1 - config.max_buy_price) / config.max_buy_price) * 100)
     log.info("  Entry window: last %ds", config.entry_window_seconds)
+    log.info("  Fill buffer: +$%.2f | Order type: %s", config.fill_buffer, config.order_type)
+    log.info("  Signals: OBI + Momentum + Volume + RSI + VWAP + TradeRate")
     log.info("=" * 50)
 
     tasks_to_run.append(asyncio.create_task(sniper.run(), name="sniper"))

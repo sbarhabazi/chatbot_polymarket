@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -60,3 +62,16 @@ class PriceSignal:
     recommended_side: str         # "Up" or "Down"
     confidence: float             # final confidence after all adjustments
     skip_reason: str | None = None
+
+    # ── Phase 1: New Indicators ──
+    obi: float = 0.0              # Order Book Imbalance (-1 to +1)
+    rsi: float = 50.0             # Fast RSI (0-100)
+    vwap: float | None = None     # Volume-Weighted Average Price
+    vwap_deviation: float = 0.0   # % deviation from VWAP
+    trade_rate: float = 0.0       # Current trades/second
+    trade_rate_ratio: float = 1.0 # Current rate / avg rate
+    buy_ratio_5s: float = 0.5    # Multi-TF buy ratio (5s window)
+    buy_ratio_15s: float = 0.5   # Multi-TF buy ratio (15s window)
+    buy_ratio_60s: float = 0.5   # Multi-TF buy ratio (60s window)
+    signal_agreement: int = 0     # How many new signals agree with direction
+    signal_total: int = 0         # Total new signals evaluated
