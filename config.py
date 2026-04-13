@@ -14,6 +14,11 @@ MARKET_INTERVAL_SECONDS = 300
 BINANCE_WS_URL = "wss://stream.binance.com:9443/ws/btcusdt@trade"
 BINANCE_DEPTH_WS_URL = "wss://stream.binance.com:9443/ws/btcusdt@depth20@100ms"
 
+# Fallback WebSocket sources (tried in order if Binance is blocked)
+KRAKEN_WS_URL = "wss://ws.kraken.com/v2"
+COINBASE_WS_URL = "wss://ws-feed.exchange.coinbase.com"
+COINGECKO_REST_URL = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd&include_24hr_vol=true"
+
 
 @dataclass(frozen=True)
 class BotConfig:

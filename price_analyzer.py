@@ -25,7 +25,13 @@ import certifi
 import numpy as np
 import websockets
 
-from config import BINANCE_WS_URL, BINANCE_DEPTH_WS_URL, BotConfig
+import aiohttp
+
+from config import (
+    BINANCE_WS_URL, BINANCE_DEPTH_WS_URL,
+    KRAKEN_WS_URL, COINBASE_WS_URL, COINGECKO_REST_URL,
+    BotConfig,
+)
 from logger import log
 from models import PriceSignal, PriceSnapshot
 
@@ -47,13 +53,17 @@ class PriceAnalyzer:
         self._asks: list[list[float]] = []
         self._depth_update_time: float = 0.0
 
+        # Track which source is active
+        self._active_source: str = "none"
+        self._binance_blocked: bool = False
+
     # ─── Lifecycle ────────────────────────────────────────────
 
     async def start(self) -> None:
         self._running = True
-        self._task = asyncio.create_task(self._consume_trade_stream())
+        self._task = asyncio.create_task(self._connect_best_trade_source())
         self._depth_task = asyncio.create_task(self._consume_depth_stream())
-        log.info("PriceAnalyzer v5 started (Trade + Depth streams)")
+        log.info("PriceAnalyzer v5 started (multi-source with fallback)")
 
     async def stop(self) -> None:
         self._running = False
@@ -79,34 +89,164 @@ class PriceAnalyzer:
             return None
         return self._prices[-1].price
 
-    # ─── Trade WebSocket Consumer ─────────────────────────────
+    # ─── Smart Source Selector ──────────────────────────────────
 
-    async def _consume_trade_stream(self) -> None:
-        backoff = 1
-        ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+    async def _connect_best_trade_source(self) -> None:
+        """Try sources in order: Binance → Kraken → Coinbase → CoinGecko REST."""
+        sources = [
+            ("Binance", self._consume_binance_trades),
+            ("Kraken", self._consume_kraken_trades),
+            ("Coinbase", self._consume_coinbase_trades),
+            ("CoinGecko REST", self._consume_coingecko_rest),
+        ]
+
         while self._running:
-            try:
-                async with websockets.connect(BINANCE_WS_URL, ssl=ssl_ctx) as ws:
-                    self._connected = True
-                    backoff = 1
-                    log.info("Binance Trade WS connected")
-                    async for message in ws:
-                        if not self._running:
-                            break
-                        data = json.loads(message)
+            for name, consumer in sources:
+                if not self._running:
+                    return
+                log.info("Trying price source: %s...", name)
+                try:
+                    await consumer()
+                    # If consumer returns normally, source failed — try next
+                except asyncio.CancelledError:
+                    return
+                except Exception as e:
+                    log.warning("%s failed: %s", name, e)
+                    self._connected = False
+
+            # All sources exhausted — wait before retry cycle
+            log.error("All price sources failed. Retrying in 30s...")
+            await asyncio.sleep(30)
+
+    # ─── Binance Trade Stream ──────────────────────────────────
+
+    async def _consume_binance_trades(self) -> None:
+        ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+        try:
+            async with websockets.connect(BINANCE_WS_URL, ssl=ssl_ctx) as ws:
+                self._connected = True
+                self._active_source = "Binance"
+                log.info("Binance Trade WS connected")
+                async for message in ws:
+                    if not self._running:
+                        break
+                    data = json.loads(message)
+                    self._prices.append(PriceSnapshot(
+                        price=float(data["p"]),
+                        timestamp=float(data["T"]) / 1000.0,
+                        volume=float(data["q"]),
+                        is_buyer_maker=bool(data.get("m", False)),
+                    ))
+        except Exception as e:
+            err_str = str(e)
+            if "451" in err_str or "403" in err_str or "geographic" in err_str.lower():
+                self._binance_blocked = True
+                log.warning("Binance geo-blocked (HTTP %s). Switching to fallback.", err_str[:50])
+            raise
+        finally:
+            self._connected = False
+
+    # ─── Kraken Trade Stream ───────────────────────────────────
+
+    async def _consume_kraken_trades(self) -> None:
+        ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+        subscribe_msg = {
+            "method": "subscribe",
+            "params": {
+                "channel": "trade",
+                "symbol": ["BTC/USD"],
+            }
+        }
+        async with websockets.connect(KRAKEN_WS_URL, ssl=ssl_ctx) as ws:
+            await ws.send(json.dumps(subscribe_msg))
+            self._connected = True
+            self._active_source = "Kraken"
+            log.info("Kraken Trade WS connected (BTC/USD)")
+
+            async for message in ws:
+                if not self._running:
+                    break
+                data = json.loads(message)
+
+                # Kraken v2 trade messages
+                if data.get("channel") == "trade":
+                    for trade in data.get("data", []):
                         self._prices.append(PriceSnapshot(
-                            price=float(data["p"]),
-                            timestamp=float(data["T"]) / 1000.0,
-                            volume=float(data["q"]),
-                            is_buyer_maker=bool(data.get("m", False)),
+                            price=float(trade["price"]),
+                            timestamp=time.time(),
+                            volume=float(trade["qty"]),
+                            is_buyer_maker=(trade.get("side", "buy") == "sell"),
                         ))
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                self._connected = False
-                log.warning("Trade WS disconnected: %s, reconnect in %ds", e, backoff)
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 60)
+        self._connected = False
+
+    # ─── Coinbase Trade Stream ─────────────────────────────────
+
+    async def _consume_coinbase_trades(self) -> None:
+        ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+        subscribe_msg = {
+            "type": "subscribe",
+            "product_ids": ["BTC-USD"],
+            "channels": ["matches"]
+        }
+        async with websockets.connect(COINBASE_WS_URL, ssl=ssl_ctx) as ws:
+            await ws.send(json.dumps(subscribe_msg))
+            self._connected = True
+            self._active_source = "Coinbase"
+            log.info("Coinbase Trade WS connected (BTC-USD)")
+
+            async for message in ws:
+                if not self._running:
+                    break
+                data = json.loads(message)
+
+                if data.get("type") == "match" or data.get("type") == "last_match":
+                    self._prices.append(PriceSnapshot(
+                        price=float(data["price"]),
+                        timestamp=time.time(),
+                        volume=float(data["size"]),
+                        is_buyer_maker=(data.get("side", "buy") == "sell"),
+                    ))
+        self._connected = False
+
+    # ─── CoinGecko REST Fallback (last resort) ─────────────────
+
+    async def _consume_coingecko_rest(self) -> None:
+        """Poll CoinGecko every 2s as last resort. No volume granularity."""
+        self._active_source = "CoinGecko REST"
+        self._connected = True
+        log.info("CoinGecko REST polling started (fallback mode, 2s interval)")
+
+        consecutive_errors = 0
+        async with aiohttp.ClientSession() as session:
+            while self._running:
+                try:
+                    async with session.get(COINGECKO_REST_URL, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            price = float(data["bitcoin"]["usd"])
+                            self._prices.append(PriceSnapshot(
+                                price=price,
+                                timestamp=time.time(),
+                                volume=0.01,  # synthetic volume
+                                is_buyer_maker=False,
+                            ))
+                            consecutive_errors = 0
+                        elif resp.status == 429:
+                            log.warning("CoinGecko rate limited. Waiting 10s...")
+                            await asyncio.sleep(10)
+                        else:
+                            consecutive_errors += 1
+                except Exception as e:
+                    consecutive_errors += 1
+                    log.warning("CoinGecko error: %s", e)
+
+                if consecutive_errors >= 10:
+                    log.error("CoinGecko too many errors. Giving up.")
+                    self._connected = False
+                    return
+
+                await asyncio.sleep(2)
+
         self._connected = False
 
     # ─── Depth WebSocket Consumer (NEW) ───────────────────────
@@ -115,6 +255,12 @@ class PriceAnalyzer:
         backoff = 1
         ssl_ctx = ssl.create_default_context(cafile=certifi.where())
         while self._running:
+            # Skip depth stream if Binance is blocked
+            if self._binance_blocked:
+                log.info("Depth stream disabled (Binance blocked). OBI will return 0.")
+                await asyncio.sleep(60)
+                continue
+
             try:
                 async with websockets.connect(BINANCE_DEPTH_WS_URL, ssl=ssl_ctx) as ws:
                     self._depth_connected = True
@@ -137,6 +283,11 @@ class PriceAnalyzer:
                 break
             except Exception as e:
                 self._depth_connected = False
+                err_str = str(e)
+                if "451" in err_str or "403" in err_str:
+                    self._binance_blocked = True
+                    log.warning("Depth WS blocked by Binance. Disabling depth stream.")
+                    continue
                 log.warning("Depth WS disconnected: %s, reconnect in %ds", e, backoff)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 60)
