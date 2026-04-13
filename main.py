@@ -24,6 +24,7 @@ from learning_engine import LearningEngine
 from logger import log
 from market_manager import MarketManager
 from price_analyzer import PriceAnalyzer
+from profit_taker import ProfitTaker
 from sniper import Sniper
 from wallet_manager import WalletManager
 
@@ -111,6 +112,23 @@ async def main() -> None:
         harvester = Harvester(config, market_manager, wallet_manager, w3,
                               learning_engine=learning_engine)
         tasks_to_run.append(asyncio.create_task(harvester.run(), name="harvester"))
+
+        # Profit Taker : virement automatique vers le wallet personnel
+        personal_wallet = os.environ.get("PERSONAL_WALLET", "")
+        if personal_wallet:
+            profit_taker = ProfitTaker(
+                config=config,
+                w3=w3,
+                personal_wallet=personal_wallet,
+                trigger_balance=float(os.environ.get("PROFIT_TRIGGER_BALANCE", "100.0")),
+                transfer_amount=float(os.environ.get("PROFIT_TRANSFER_AMOUNT", "50.0")),
+                trading_reserve=float(os.environ.get("PROFIT_TRADING_RESERVE", "40.0")),
+            )
+            tasks_to_run.append(asyncio.create_task(profit_taker.run(), name="profit_taker"))
+            log.info("ProfitTaker enabled — trigger=$%.0f, transfer=$%.0f",
+                     profit_taker._trigger_balance, profit_taker._transfer_amount)
+        else:
+            log.info("ProfitTaker disabled — set PERSONAL_WALLET in env to enable")
 
     # Graceful shutdown
     shutdown_event = asyncio.Event()
