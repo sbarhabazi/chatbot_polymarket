@@ -436,7 +436,9 @@ class Sniper:
                 )
                 return True
             else:
-                success = await self._place_limit_buy(token_id, bet_amount, share_price, signal.confidence)
+                # Pass best_ask from refreshed market for tighter pricing
+                best_ask = refreshed.best_ask if refreshed and refreshed.best_ask > 0 else share_price
+                success = await self._place_limit_buy(token_id, bet_amount, share_price, signal.confidence, best_ask=best_ask)
                 if success:
                     self._last_traded_window = compute_window_timestamp()
                     self._wm.invalidate_cache()
@@ -450,18 +452,18 @@ class Sniper:
                     log.warning("Order failed at scan #%d", scan_count)
                     return False
 
-    async def _place_limit_buy(self, token_id: str, amount_usdc: float, price: float, confidence: float = 0.65) -> bool:
-        """Place a buy order with dynamic fill buffer based on confidence.
+    async def _place_limit_buy(self, token_id: str, amount_usdc: float, price: float, confidence: float = 0.65, best_ask: float = 0.0) -> bool:
+        """Place a buy order priced just above best_ask for reliable fills.
 
-        Higher confidence → more aggressive pricing (willing to pay more for fills).
-        At conf=0.60: offer = market + base_buffer
-        At conf=0.85: offer = market + base_buffer + 0.075 (confidence bonus)
+        Strategy: offer best_ask + small fixed buffer ($0.02) to get priority
+        in the order book without overpaying. Confidence bonus capped at $0.03.
 
         Args:
             token_id: The Polymarket token ID
             amount_usdc: USDC to spend
-            price: Market price per share (e.g. 0.50 = $0.50/share)
-            confidence: Signal confidence (0-1), used to scale the fill buffer
+            price: Market mid price per share (e.g. 0.50 = $0.50/share)
+            confidence: Signal confidence (0-1)
+            best_ask: Best ask price from order book (used as base for offer)
         """
         try:
             from py_clob_client.clob_types import OrderArgs, OrderType
@@ -480,12 +482,14 @@ class Sniper:
             }
             order_type = order_type_map.get(order_type_str, OrderType.FOK)
 
-            # Dynamic buffer: higher confidence → willing to pay more for fills
-            # At 50/50 market ($0.50), static $0.10-0.15 buffer gets no fills
-            # because sellers hold shares worth $0.80+ at high confidence
-            confidence_bonus = max(0, (confidence - 0.60)) * 0.30
+            # Price just above best_ask for reliable fills.
+            # Use best_ask as anchor if available; fallback to mid price.
+            # Small fixed buffer ($0.02) to get order book priority.
+            # Tiny confidence bonus (max $0.03) — don't overpay vs. market.
+            ask_anchor = best_ask if best_ask > price else price
+            confidence_bonus = min(max(0, (confidence - 0.60)) * 0.075, 0.03)
             fill_buffer = base_buffer + confidence_bonus
-            offer_price = min(math.ceil((price + fill_buffer) * 100) / 100, 0.95)
+            offer_price = min(math.ceil((ask_anchor + 0.02) * 100) / 100, self._config.max_buy_price)
             size = int(amount_usdc / offer_price)  # Floor to whole shares
 
             if size < 1:
