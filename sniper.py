@@ -311,7 +311,8 @@ class Sniper:
             return False
 
         # Determine token and price
-        if signal.recommended_side == "Up":
+        chosen_side = signal.recommended_side
+        if chosen_side == "Up":
             token_id = market.up_token_id
             share_price = market.up_price
         else:
@@ -321,14 +322,55 @@ class Sniper:
         # Refresh prices
         refreshed = await self._mm.get_market_by_window_ts(market.window_ts)
         if refreshed and refreshed.accepting_orders:
-            if signal.recommended_side == "Up":
+            if chosen_side == "Up":
                 share_price = refreshed.up_price
             else:
                 share_price = refreshed.down_price
 
+        # Check 6: Affordability — si le côté recommandé coûte trop cher (> 99% solde pour 5 parts)
+        # et que le côté opposé est accessible, essayer l'opposé si le signal est assez fort
+        balance_now = await self._wm.get_usdc_balance(force_refresh=True)
+        offer_price_check = min(
+            (share_price + 0.02 + self._config.fill_buffer),
+            self._config.max_buy_price
+        )
+        min_required = 5 * offer_price_check
+        if min_required > balance_now * 0.99 and refreshed:
+            # Côté recommandé hors de portée — essayer l'opposé
+            if chosen_side == "Up":
+                alt_price = refreshed.down_price
+                alt_token_id = market.down_token_id
+                alt_side = "Down"
+            else:
+                alt_price = refreshed.up_price
+                alt_token_id = market.up_token_id
+                alt_side = "Up"
+
+            alt_offer = min(alt_price + 0.02 + self._config.fill_buffer, self._config.max_buy_price)
+            alt_required = 5 * alt_offer
+
+            if alt_required <= balance_now * 0.99 and alt_price <= self._config.max_buy_price:
+                log.info(
+                    "Capital bas ($%.2f) — côté %s trop cher ($%.2f/part, need $%.2f). "
+                    "Bascule vers %s @ $%.3f/part",
+                    balance_now, chosen_side, share_price, min_required,
+                    alt_side, alt_price,
+                )
+                chosen_side = alt_side
+                token_id = alt_token_id
+                share_price = alt_price
+                if refreshed:
+                    best_ask_alt = refreshed.best_ask if refreshed.best_ask > 0 and chosen_side == signal.recommended_side else alt_price
+            else:
+                log.warning(
+                    "SKIP capital: les deux côtés hors de portée ($%.2f) — Up=$%.3f, Down=$%.3f",
+                    balance_now, refreshed.up_price if refreshed else 0, refreshed.down_price if refreshed else 0,
+                )
+                return False
+
         net_yield = calculate_net_yield(share_price)
 
-        # Check 6: Price acceptable?
+        # Check price acceptable?
         if not WalletManager.yield_acceptable(share_price, self._config.max_buy_price):
             log.info("SKIP: Price $%.3f > max $%.2f", share_price, self._config.max_buy_price)
             return False
@@ -399,16 +441,17 @@ class Sniper:
 
         log.info(
             "BUY [%s/%s]: %s | $%.2f (kelly=%.1f%% of $%.2f) @ $%.3f | "
-            "yield=%.1f%% | dist=$%.1f | signals=%d/%d",
-            tier, mode_label, signal.recommended_side, bet_amount, size_fraction * 100,
+            "yield=%.1f%% | dist=$%.1f | signals=%d/%d%s",
+            tier, mode_label, chosen_side, bet_amount, size_fraction * 100,
             balance, share_price, net_yield * 100, signal.btc_distance,
             signal.signal_agreement, signal.signal_total,
+            " [FLIPPED]" if chosen_side != signal.recommended_side else "",
         )
 
         # Enregistrer le trade dans le learning engine
         trade_record = TradeRecord(
             window_ts=market.window_ts,
-            side=signal.recommended_side,
+            side=chosen_side,
             btc_distance=signal.btc_distance,
             seconds_remaining=remaining,
             confidence=signal.confidence,
@@ -461,7 +504,12 @@ class Sniper:
                 return True
             else:
                 # Pass best_ask from refreshed market for tighter pricing
-                best_ask = refreshed.best_ask if refreshed and refreshed.best_ask > 0 else share_price
+                # Note: best_ask from CLOB is for the token we're buying
+                # If we flipped sides, best_ask of the original side doesn't apply
+                if refreshed and refreshed.best_ask > 0 and chosen_side == signal.recommended_side:
+                    best_ask = refreshed.best_ask
+                else:
+                    best_ask = share_price  # Use market price directly if flipped
                 success = await self._place_limit_buy(token_id, bet_amount, share_price, signal.confidence, best_ask=best_ask)
                 if success:
                     self._last_traded_window = compute_window_timestamp()
@@ -573,7 +621,7 @@ class Sniper:
                 # seulement si on a assez de capital
                 required_amount = POLY_MIN_SIZE * offer_price
                 balance_check = await self._wm.get_usdc_balance()
-                if required_amount <= balance_check * 0.95:  # max 95% du solde
+                if required_amount <= balance_check * 0.99:  # max 99% du solde en mode survie
                     log.info(
                         "Ajustement taille: %d → %d parts (minimum Polymarket) | $%.2f → $%.2f",
                         size, POLY_MIN_SIZE, amount_usdc, required_amount,
@@ -581,7 +629,8 @@ class Sniper:
                     size = POLY_MIN_SIZE
                 else:
                     log.warning(
-                        "SKIP: %d parts < minimum 5, et fonds insuffisants ($%.2f requis, $%.2f dispo)",
+                        "SKIP: %d parts < minimum 5, fonds insuffisants ($%.2f requis, $%.2f dispo) "
+                        "— ce côté coûte trop cher avec le capital actuel",
                         size, required_amount, balance_check,
                     )
                     return False
