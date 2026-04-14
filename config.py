@@ -94,7 +94,7 @@ class BotConfig:
             order_type=os.environ.get("ORDER_TYPE", "FOK").upper(),
             kelly_fraction=float(os.environ.get("KELLY_FRACTION", "0.50")),
             max_kelly_size=float(os.environ.get("MAX_KELLY_SIZE", "0.20")),
-            min_bet_amount=float(os.environ.get("MIN_BET_AMOUNT", "3.0")),
+            min_bet_amount=float(os.environ.get("MIN_BET_AMOUNT", "2.0")),
             harvest_poll_interval=int(os.environ.get("HARVEST_POLL_INTERVAL", "30")),
             max_recent_markets=int(os.environ.get("MAX_RECENT_MARKETS_TO_CHECK", "20")),
             paper_trading=paper,
