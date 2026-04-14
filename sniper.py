@@ -4,6 +4,7 @@ import asyncio
 
 from web3 import Web3
 
+from balance_guard import BalanceGuard
 from config import BotConfig
 from contracts.abis import CHAINLINK_AGGREGATOR_ABI
 from contracts.addresses import CHAINLINK_BTC_USD
@@ -338,49 +339,42 @@ class Sniper:
             log.warning("SKIP: Liquidity $%.0f < min", market.liquidity)
             return False
 
-        # Check 8: Adaptive position sizing
+        # Check 8: Adaptive position sizing via BalanceGuard
         balance = await self._wm.get_usdc_balance(force_refresh=True)
 
-        # Absolute minimum: $0.50 (1 share @ $0.50)
-        abs_min_bet = max(0.50, self._config.min_bet_amount * 0.25)
+        # Lire le mode courant depuis le BalanceGuard
+        guard_state = BalanceGuard.read_current_mode()
+        mode_label   = guard_state.get("mode", "NORMAL")
+        kelly_cap    = guard_state.get("kelly_cap", 0.20)
+        kelly_frac   = guard_state.get("kelly_fraction", 0.50)
+        min_conf     = guard_state.get("min_confidence", 0.60)
 
-        # MODE SURVIE: capital < $15 → sizing agressif pour reconstruire
-        # On risque jusqu'à 40% sur conf ≥ 0.85, 25% sur conf ≥ 0.65
-        # Pas de plafond max_kelly_size en mode survie
-        SURVIVAL_THRESHOLD = 15.0
+        # Plancher absolu: $0.50
+        abs_min_bet = 0.50
 
-        if balance < SURVIVAL_THRESHOLD:
-            # Mode survie: on maximise la taille pour remonter rapidement
-            # EV positif = on bet, EV négatif = on skip
-            kelly_size = compute_kelly_size(
-                confidence=signal.confidence,
-                share_price=share_price,
-                kelly_fraction=1.0,  # Full Kelly en mode survie
+        # Vérification de confiance minimale selon le mode
+        if signal.confidence < min_conf:
+            log.info(
+                "SKIP: conf=%.2f < %.2f minimum (%s mode)",
+                signal.confidence, min_conf, mode_label,
             )
-            if kelly_size <= 0:
-                log.info(
-                    "SKIP: EV négatif en mode survie (conf=%.2f, price=$%.2f)",
-                    signal.confidence, share_price,
-                )
-                return False
-            # Plafonner à 50% max du solde (protect contre ruinée totale)
-            size_fraction = min(kelly_size, 0.50)
-            mode_label = "SURVIE"
-        else:
-            # Mode normal: Kelly fractionné avec plafond
-            kelly_size = compute_kelly_size(
-                confidence=signal.confidence,
-                share_price=share_price,
-                kelly_fraction=self._config.kelly_fraction,
+            return False
+
+        # Calcul Kelly avec paramètres du mode
+        kelly_size = compute_kelly_size(
+            confidence=signal.confidence,
+            share_price=share_price,
+            kelly_fraction=kelly_frac,
+        )
+
+        if kelly_size <= 0:
+            log.info(
+                "SKIP: EV négatif (conf=%.2f, price=$%.2f, mode=%s)",
+                signal.confidence, share_price, mode_label,
             )
-            if kelly_size <= 0:
-                log.info(
-                    "SKIP: Kelly says no bet (EV negative at conf=%.2f, price=$%.2f)",
-                    signal.confidence, share_price,
-                )
-                return False
-            size_fraction = min(kelly_size, self._config.max_kelly_size)
-            mode_label = "NORMAL"
+            return False
+
+        size_fraction = min(kelly_size, kelly_cap)
 
         # Determine tier for logging
         if signal.confidence >= self._config.high_confidence_threshold:
@@ -392,7 +386,7 @@ class Sniper:
 
         bet_amount = round(balance * size_fraction, 2)
 
-        # Plancher absolu: $0.50 minimum pour couvrir les frais on-chain
+        # Plancher absolu: $0.50
         if bet_amount < abs_min_bet:
             log.warning(
                 "SKIP: Bet $%.2f < $%.2f min absolu (balance=$%.2f, kelly=%.1f%%, mode=%s)",

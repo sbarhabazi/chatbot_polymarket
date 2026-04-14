@@ -20,6 +20,7 @@ import os
 import signal
 import sys
 
+from balance_guard import BalanceGuard
 from config import CHAIN_ID, CLOB_HOST, SIGNATURE_TYPE, BotConfig
 from learning_engine import LearningEngine
 from logger import log
@@ -158,6 +159,17 @@ async def main() -> None:
 
     tasks_to_run.append(asyncio.create_task(sniper.run(), name="sniper"))
     tasks_to_run.append(asyncio.create_task(shutdown_event.wait(), name="shutdown"))
+
+    # Process D: Balance Guard (live mode seulement)
+    if not config.paper_trading and w3 is not None:
+        balance_guard = BalanceGuard(
+            wallet_address=config.wallet_address,
+            w3=w3,
+            shutdown_event=shutdown_event,
+            check_interval=60,
+        )
+        tasks_to_run.append(asyncio.create_task(balance_guard.run(), name="balance_guard"))
+        log.info("BalanceGuard (Process D) enabled — arrêt automatique si solde < $0.50")
 
     try:
         done, pending = await asyncio.wait(tasks_to_run, return_when=asyncio.FIRST_COMPLETED)
