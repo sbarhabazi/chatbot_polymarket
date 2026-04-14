@@ -23,6 +23,7 @@ import sys
 from balance_guard import BalanceGuard
 from config import CHAIN_ID, CLOB_HOST, SIGNATURE_TYPE, BotConfig
 from learning_engine import LearningEngine
+from live_optimizer import LiveOptimizer
 from logger import log
 from market_manager import MarketManager
 from price_analyzer import PriceAnalyzer
@@ -146,7 +147,7 @@ async def main() -> None:
     await price_analyzer.start()
 
     log.info("=" * 50)
-    log.info("POLYMARKET 5-MIN BTC SNIPER BOT v5 RUNNING")
+    log.info("POLYMARKET 5-MIN BTC SNIPER BOT v6 RUNNING")
     log.info("  Sizing: Kelly (fraction=%.0f%%, max=%.0f%%)",
              config.kelly_fraction * 100, config.max_kelly_size * 100)
     log.info("  Max buy price: $%.2f (min yield ~%.0f%%)",
@@ -170,6 +171,11 @@ async def main() -> None:
         )
         tasks_to_run.append(asyncio.create_task(balance_guard.run(), name="balance_guard"))
         log.info("BalanceGuard (Process D) enabled — arrêt automatique si solde < $0.50")
+
+    # Process E: Live Optimizer (optimisation interne toutes les 30 minutes)
+    live_optimizer = LiveOptimizer(learning_engine=learning_engine)
+    tasks_to_run.append(asyncio.create_task(live_optimizer.run(), name="live_optimizer"))
+    log.info("LiveOptimizer (Process E) enabled — recalibration toutes les 30min")
 
     try:
         done, pending = await asyncio.wait(tasks_to_run, return_when=asyncio.FIRST_COMPLETED)

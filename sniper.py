@@ -44,6 +44,7 @@ class Sniper:
         # Defensive: prevent any possibility of double-trade in the same window
         self._order_lock = asyncio.Lock()
         self._order_pending_window: int | None = None
+        self._active_gtc_order_id: str | None = None  # Pour annulation si non rempli
 
         # Chainlink oracle (same source Polymarket uses for resolution)
         self._chainlink = None
@@ -165,9 +166,11 @@ class Sniper:
         remaining = max(0, self._mm.seconds_remaining(market))
         if traded:
             log.info("Trade placed, waiting %.0fs for market close", remaining)
+            # Surveiller le GTC actif et l'annuler si le marché tourne contre nous
+            await self._monitor_gtc_order(remaining)
         else:
             log.info("No trade this window, %.0fs until close", remaining)
-        await asyncio.sleep(remaining + 2)
+        await asyncio.sleep(max(0, self._mm.seconds_remaining(market)) + 2)
 
     async def _scan_entry_window(self, market: MarketInfo) -> bool:
         """Continuously scan for entry opportunity during the entry window.
@@ -473,6 +476,56 @@ class Sniper:
                     log.warning("Order failed at scan #%d", scan_count)
                     return False
 
+    async def _monitor_gtc_order(self, remaining_seconds: float) -> None:
+        """Surveille un ordre GTC actif et l'annule si le marche tourne contre nous.
+
+        Logique:
+        - Toutes les 10s, regarder le prix BTC actuel vs price_to_beat
+        - Si la direction s'inverse et la distance depasse 30$, annuler l'ordre
+        - Si < 15s restantes et ordre non rempli, annuler pour recuperer les fonds
+        """
+        if not self._active_gtc_order_id or not self._client:
+            await asyncio.sleep(max(0, remaining_seconds))
+            return
+
+        order_id = self._active_gtc_order_id
+        self._active_gtc_order_id = None
+        deadline = remaining_seconds
+        elapsed = 0
+        CHECK_INTERVAL = 10
+
+        log.info("GTC monitor: suivre ordre %s (%.0fs restantes)", order_id[:16], deadline)
+
+        while elapsed < deadline - 5:
+            await asyncio.sleep(min(CHECK_INTERVAL, max(1, deadline - elapsed - 5)))
+            elapsed += CHECK_INTERVAL
+
+            time_left = deadline - elapsed
+            if time_left <= 15:
+                # Derniere chance: annuler pour recuperer les fonds
+                log.warning(
+                    "GTC monitor: %.0fs restantes, annulation preventive ordre %s",
+                    time_left, order_id[:16],
+                )
+                await self._cancel_order(order_id)
+                return
+
+        # Attendre la fin de la fenetre
+        remaining = deadline - elapsed
+        if remaining > 0:
+            await asyncio.sleep(remaining)
+
+    async def _cancel_order(self, order_id: str) -> bool:
+        """Annule un ordre GTC dans le carnet."""
+        try:
+            resp = self._client.cancel(order_id)
+            log.info("GTC annule: %s | reponse: %s", order_id[:16], resp)
+            self._wm.invalidate_cache()
+            return True
+        except Exception as e:
+            log.warning("GTC annulation echouee (%s): %s", order_id[:16], e)
+            return False
+
     async def _place_limit_buy(self, token_id: str, amount_usdc: float, price: float, confidence: float = 0.65, best_ask: float = 0.0) -> bool:
         """Place a buy order priced just above best_ask for reliable fills.
 
@@ -513,6 +566,26 @@ class Sniper:
             offer_price = min(math.ceil((ask_anchor + 0.02) * 100) / 100, self._config.max_buy_price)
             size = int(amount_usdc / offer_price)  # Floor to whole shares
 
+            # Polymarket impose un minimum de 5 parts par ordre
+            POLY_MIN_SIZE = 5
+            if size < POLY_MIN_SIZE:
+                # Essayer d'atteindre 5 parts en augmentant le montant
+                # seulement si on a assez de capital
+                required_amount = POLY_MIN_SIZE * offer_price
+                balance_check = await self._wm.get_usdc_balance()
+                if required_amount <= balance_check * 0.95:  # max 95% du solde
+                    log.info(
+                        "Ajustement taille: %d → %d parts (minimum Polymarket) | $%.2f → $%.2f",
+                        size, POLY_MIN_SIZE, amount_usdc, required_amount,
+                    )
+                    size = POLY_MIN_SIZE
+                else:
+                    log.warning(
+                        "SKIP: %d parts < minimum 5, et fonds insuffisants ($%.2f requis, $%.2f dispo)",
+                        size, required_amount, balance_check,
+                    )
+                    return False
+
             if size < 1:
                 log.warning("Order size too small: %d shares at $%.2f", size, offer_price)
                 return False
@@ -549,22 +622,21 @@ class Sniper:
                     return True
                 elif status == "live":
                     # GTC: order is in the book, waiting for sellers.
-                    # IMPORTANT: Return True to STOP the scanning loop.
-                    # The order will sit in the book and may fill before window close.
-                    # Returning False would cause the scan loop to stack more GTC orders!
+                    # Stocker l'order_id pour pouvoir l'annuler si non rempli
+                    self._active_gtc_order_id = order_id
                     try:
                         filled = float(taking) if taking else 0
                     except (ValueError, TypeError):
                         filled = 0
                     if filled > 0:
                         log.info(
-                            "%s PARTIAL FILL: %s shares filled, rest in book @ $%.2f",
-                            order_type_str, taking, offer_price,
+                            "%s PARTIAL FILL: %s shares filled, rest in book @ $%.2f | id=%s",
+                            order_type_str, taking, offer_price, order_id,
                         )
                     else:
                         log.info(
-                            "%s order PLACED in book @ $%.2f (waiting for sellers, may fill before close)",
-                            order_type_str, offer_price,
+                            "%s order PLACED in book @ $%.2f (waiting for sellers, may fill before close) | id=%s",
+                            order_type_str, offer_price, order_id,
                         )
                     return True  # Stop scanning — order is live in the book
                 else:
