@@ -127,33 +127,36 @@ class ProfitTaker:
 
         log.info("ProfitTaker: balance=$%.2f (trigger=$%.0f)", balance, self._trigger_balance)
 
-        # Vérifier si le seuil est atteint
+        # Vérifier si le seuil est atteint (solde >= trigger)
         if balance < self._trigger_balance:
             return
 
-        # Vérifier qu'il restera assez pour trader après le transfert
-        balance_after = balance - self._transfer_amount
-        if balance_after < self._trading_reserve:
+        # Montant à transférer = solde - trading_reserve ($50)
+        # Le solde résiduel est toujours exactement trading_reserve après le transfert
+        actual_transfer = balance - self._trading_reserve
+
+        if actual_transfer < 1.0:
             log.warning(
-                "ProfitTaker: SKIP — balance after transfer ($%.2f) would be "
-                "below trading reserve ($%.0f)",
-                balance_after, self._trading_reserve,
+                "ProfitTaker: SKIP — montant calculé trop faible ($%.2f)",
+                actual_transfer,
             )
             return
 
         log.info(
-            "ProfitTaker: TRIGGER! Balance $%.2f >= $%.0f — transferring $%.0f to %s...%s",
+            "ProfitTaker: TRIGGER! Balance $%.2f >= $%.0f — transferring $%.2f "
+            "(solde - $%.0f reserve) to %s...%s",
             balance, self._trigger_balance,
-            self._transfer_amount,
+            actual_transfer, self._trading_reserve,
             str(self._personal_wallet)[:8], str(self._personal_wallet)[-4:],
         )
 
-        success, tx_hash = await self._transfer_usdc(wallet, self._transfer_amount)
+        success, tx_hash = await self._transfer_usdc(wallet, actual_transfer)
 
         entry = {
             "timestamp": time.time(),
             "balance_before": balance,
-            "amount_transferred": self._transfer_amount,
+            "amount_transferred": actual_transfer,
+            "balance_after_target": self._trading_reserve,
             "destination": str(self._personal_wallet),
             "success": success,
             "tx_hash": tx_hash,
@@ -162,10 +165,10 @@ class ProfitTaker:
 
         if success:
             log.info(
-                "ProfitTaker: TRANSFER OK — $%.0f → %s...%s | tx: %s",
-                self._transfer_amount,
+                "ProfitTaker: TRANSFER OK — $%.2f → %s...%s | tx: %s | solde résiduel cible: $%.0f",
+                actual_transfer,
                 str(self._personal_wallet)[:8], str(self._personal_wallet)[-4:],
-                tx_hash,
+                tx_hash, self._trading_reserve,
             )
             total_transferred = sum(h["amount_transferred"] for h in self._history if h["success"])
             log.info("ProfitTaker: total profits secured = $%.2f", total_transferred)
