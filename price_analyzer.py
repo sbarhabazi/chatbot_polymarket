@@ -211,16 +211,20 @@ class PriceAnalyzer:
     # ─── CoinGecko REST Fallback (last resort) ─────────────────
 
     async def _consume_coingecko_rest(self) -> None:
-        """Poll CoinGecko every 2s as last resort. No volume granularity."""
+        """Poll CoinGecko every 15s as last resort. No volume granularity.
+        Exits after 5 consecutive rate-limits to let the source selector retry
+        Binance/Kraken WebSocket.
+        """
         self._active_source = "CoinGecko REST"
         self._connected = True
-        log.info("CoinGecko REST polling started (fallback mode, 2s interval)")
+        log.info("CoinGecko REST polling started (fallback mode, 15s interval)")
 
         consecutive_errors = 0
+        consecutive_ratelimits = 0
         async with aiohttp.ClientSession() as session:
             while self._running:
                 try:
-                    async with session.get(COINGECKO_REST_URL, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                    async with session.get(COINGECKO_REST_URL, timeout=aiohttp.ClientTimeout(total=8)) as resp:
                         if resp.status == 200:
                             data = await resp.json()
                             price = float(data["bitcoin"]["usd"])
@@ -231,9 +235,23 @@ class PriceAnalyzer:
                                 is_buyer_maker=False,
                             ))
                             consecutive_errors = 0
+                            consecutive_ratelimits = 0
                         elif resp.status == 429:
-                            log.warning("CoinGecko rate limited. Waiting 10s...")
-                            await asyncio.sleep(10)
+                            consecutive_ratelimits += 1
+                            wait = min(30 * consecutive_ratelimits, 120)
+                            log.warning(
+                                "CoinGecko rate limited (%d/5). Waiting %ds...",
+                                consecutive_ratelimits, wait
+                            )
+                            if consecutive_ratelimits >= 5:
+                                log.warning(
+                                    "CoinGecko rate-limited 5x in a row — "
+                                    "exiting to retry Binance/Kraken WebSocket"
+                                )
+                                self._connected = False
+                                return
+                            await asyncio.sleep(wait)
+                            continue
                         else:
                             consecutive_errors += 1
                 except Exception as e:
@@ -245,7 +263,7 @@ class PriceAnalyzer:
                     self._connected = False
                     return
 
-                await asyncio.sleep(2)
+                await asyncio.sleep(15)  # 15s entre chaque poll (limite API gratuite)
 
         self._connected = False
 
