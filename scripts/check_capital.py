@@ -7,12 +7,18 @@ Envoie une alerte si :
 """
 
 from web3 import Web3
-import json, os, sys
+from web3.middleware import ExtraDataToPOAMiddleware
+import json, os, sys, time
 from pathlib import Path
 from datetime import datetime
 
 WALLET = "0x0f6768A0ff895433827531f83933D805CF979B02"
-RPC = "https://polygon-bor-rpc.publicnode.com"
+# RPCs de fallback — si le premier timeout, on essaie les suivants
+RPC_LIST = [
+    "https://polygon-bor-rpc.publicnode.com",
+    "https://polygon-rpc.com",
+    "https://rpc-mainnet.matic.quiknode.pro",
+]
 USDC_E = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
 TRACKING_FILE = "/home/user/workspace/cron_tracking/capital_check.json"
 
@@ -32,16 +38,34 @@ def save_state(state):
     with open(TRACKING_FILE, "w") as f:
         json.dump(state, f, indent=2)
 
-def main():
-    w3 = Web3(Web3.HTTPProvider(RPC))
+def get_balances_with_fallback():
+    """Essaie chaque RPC jusqu'à obtenir une réponse valide."""
     abi = [{"inputs": [{"name": "account", "type": "address"}], "name": "balanceOf",
             "outputs": [{"name": "", "type": "uint256"}], "stateMutability": "view", "type": "function"}]
-
     wallet = Web3.to_checksum_address(WALLET)
-    usdc_contract = w3.eth.contract(address=Web3.to_checksum_address(USDC_E), abi=abi)
 
-    usdc_balance = usdc_contract.functions.balanceOf(wallet).call() / 1e6
-    pol_balance = w3.eth.get_balance(wallet) / 1e18
+    last_error = None
+    for rpc in RPC_LIST:
+        try:
+            w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 10}))
+            w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+            usdc_contract = w3.eth.contract(address=Web3.to_checksum_address(USDC_E), abi=abi)
+            usdc_balance = usdc_contract.functions.balanceOf(wallet).call() / 1e6
+            pol_balance = w3.eth.get_balance(wallet) / 1e18
+            return usdc_balance, pol_balance
+        except Exception as e:
+            last_error = e
+            continue
+
+    raise RuntimeError(f"Tous les RPCs ont échoué. Dernier: {last_error}")
+
+def main():
+    try:
+        usdc_balance, pol_balance = get_balances_with_fallback()
+    except RuntimeError as e:
+        # Erreur RPC — exit code 2 (distinct de 1=alerte) pour ne pas envoyer de fausse alerte
+        print(json.dumps({"error": str(e), "rpc_failure": True}))
+        sys.exit(2)
 
     last = load_last_state()
     last_usdc = last.get("usdc_balance", usdc_balance)

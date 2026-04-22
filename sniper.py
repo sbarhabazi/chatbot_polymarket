@@ -40,6 +40,7 @@ class Sniper:
         self._paper_trades: list[dict] = []
         self._chainlink_open_price: float | None = None
         self._price_source: str = "none"  # "api", "binance", "kraken", "chainlink"
+        self._order_attempted_this_window: bool = False  # 1 ordre max par fenêtre
 
         # Defensive: prevent any possibility of double-trade in the same window
         self._order_lock = asyncio.Lock()
@@ -155,6 +156,9 @@ class Sniper:
             await asyncio.sleep(5)
             return
 
+        # Reset le flag d'ordre tenté pour cette fenêtre
+        self._order_attempted_this_window = False
+
         # Entry window — scan continuously until trade or window closes
         traded = await self._scan_entry_window(market)
         # Mark window as traded (defensive: _attempt_entry already sets this on success,
@@ -175,11 +179,12 @@ class Sniper:
     async def _scan_entry_window(self, market: MarketInfo) -> bool:
         """Continuously scan for entry opportunity during the entry window.
 
-        Instead of checking once, scans every 5s until:
-        - A trade is executed (return True)
-        - The window closes (return False)
+        Scans every 5s until a valid signal appears, then places ONE order
+        and immediately returns — never multiple orders per window.
         """
         scan_count = 0
+        order_attempted = False  # Garde-fou: un seul essai de placement par fenêtre
+
         while True:
             remaining = self._mm.seconds_remaining(market)
             if remaining <= 2:
@@ -189,8 +194,15 @@ class Sniper:
             if result:
                 return True  # Trade executed
 
+            # Si le signal était assez fort pour tenter un ordre mais qu'il a échoué
+            # (API error, rejet, etc.), on NE réessaie PAS dans cette fenêtre
+            if hasattr(self, '_order_attempted_this_window') and self._order_attempted_this_window:
+                log.info("Ordre tenté cette fenêtre — pas de nouvel essai (1 ordre max/fenêtre)")
+                return False
+
             scan_count += 1
-            # Wait 5s before next scan (but not if window is about to close)
+            # En attendant le prochain scan, vérifier si on vient d'entrer en fenêtre
+            # → attendre 5s max (mais pas si la fenêtre se ferme)
             wait = min(5, max(1, remaining - 2))
             await asyncio.sleep(wait)
 
@@ -310,6 +322,18 @@ class Sniper:
                 )
             return False
 
+        # Check 5b: Signal agreement — minimum 2/4 indicateurs concordants
+        # Un signal 0/4 ou 1/4 est du bruit pur, pas une edge exploitable
+        MIN_SIGNAL_AGREEMENT = 2
+        if signal.signal_total > 0 and signal.signal_agreement < MIN_SIGNAL_AGREEMENT:
+            if verbose:
+                log.info(
+                    "  → SKIP: signal_agreement %d/%d < %d minimum "
+                    "(pas assez d'indicateurs concordants)",
+                    signal.signal_agreement, signal.signal_total, MIN_SIGNAL_AGREEMENT,
+                )
+            return False
+
         # Determine token and price
         chosen_side = signal.recommended_side
         if chosen_side == "Up":
@@ -349,7 +373,10 @@ class Sniper:
             alt_offer = min(alt_price + 0.02 + self._config.fill_buffer, self._config.max_buy_price)
             alt_required = 5 * alt_offer
 
-            if alt_required <= balance_now * 0.99 and alt_price <= self._config.max_buy_price:
+            # GARDE-FOU: ne jamais flipper vers un prix < $0.15/part
+            # (marché quasi-résolu, probabilité de gain proche de zéro)
+            ALT_MIN_PRICE = 0.15
+            if alt_required <= balance_now * 0.99 and alt_price >= ALT_MIN_PRICE and alt_price <= self._config.max_buy_price:
                 log.info(
                     "Capital bas ($%.2f) — côté %s trop cher ($%.2f/part, need $%.2f). "
                     "Bascule vers %s @ $%.3f/part",
@@ -362,10 +389,16 @@ class Sniper:
                 if refreshed:
                     best_ask_alt = refreshed.best_ask if refreshed.best_ask > 0 and chosen_side == signal.recommended_side else alt_price
             else:
-                log.warning(
-                    "SKIP capital: les deux côtés hors de portée ($%.2f) — Up=$%.3f, Down=$%.3f",
-                    balance_now, refreshed.up_price if refreshed else 0, refreshed.down_price if refreshed else 0,
-                )
+                if alt_price < ALT_MIN_PRICE:
+                    log.warning(
+                        "SKIP capital: côté alternatif ($%.3f/part) trop bas — marché quasi-résolu, skip",
+                        alt_price,
+                    )
+                else:
+                    log.warning(
+                        "SKIP capital: les deux côtés hors de portée ($%.2f) — Up=$%.3f, Down=$%.3f",
+                        balance_now, refreshed.up_price if refreshed else 0, refreshed.down_price if refreshed else 0,
+                    )
                 return False
 
         net_yield = calculate_net_yield(share_price)
@@ -438,6 +471,10 @@ class Sniper:
                 bet_amount, abs_min_bet, balance, kelly_size * 100, mode_label,
             )
             return False
+
+        # Marquer que l'on tente un ordre dans cette fenêtre
+        # (même si l'API rejette, on ne réessaiera pas cette fenêtre)
+        self._order_attempted_this_window = True
 
         log.info(
             "BUY [%s/%s]: %s | $%.2f (kelly=%.1f%% of $%.2f) @ $%.3f | "
