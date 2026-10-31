@@ -3,7 +3,7 @@ Audit de sécurité automatique du bot Polymarket — avec AUTO-CORRECTION.
 
 Vérifie ET corrige automatiquement :
   1. Secrets hardcodés dans le code source
-  2. Fichiers sensibles non couverts par .gitignore  → AUTO-FIX: ajoute au .gitignore + git push
+  2. Fichiers sensibles non couverts par .gitignore  → AUTO-FIX: ajoute au .gitignore (non commité)
   3. Dépendances Python avec CVE connues             → AUTO-FIX: pip-audit --fix + màj requirements.txt
   4. Allowances ERC-20 vers contrats inconnus        → ESCALADE: ne peut pas révoquer sans clé privée live
   5. Intégrité des fichiers critiques (checksums)    → ESCALADE si modification suspecte (sans commit git)
@@ -11,6 +11,11 @@ Vérifie ET corrige automatiquement :
   7. Données sensibles dans les logs                 → AUTO-FIX: supprime le fichier de log compromis
 
 Exécuté chaque dimanche à 23h EDT par Perplexity Computer.
+
+Les corrections sont appliquées dans la copie de travail mais ne sont JAMAIS
+commitées ni poussées automatiquement : un humain relit le diff (git diff) et
+committe lui-même. Un `git add -A` automatique pourrait publier un fichier
+sensible non encore ignoré (.env, journaux, données de trading).
 """
 
 import hashlib
@@ -84,29 +89,6 @@ def save_checksums(cs):
     CHECKSUM_FILE.parent.mkdir(parents=True, exist_ok=True)
     with open(CHECKSUM_FILE, "w") as f:
         json.dump(cs, f, indent=2)
-
-def git_commit_push(message: str) -> bool:
-    """Commit et push les changements vers GitHub."""
-    try:
-        subprocess.run(["git", "add", "-A"], cwd=REPO_DIR, check=True, capture_output=True)
-        result = subprocess.run(
-            ["git", "diff", "--cached", "--quiet"],
-            cwd=REPO_DIR, capture_output=True
-        )
-        if result.returncode == 0:
-            return True  # Rien à commiter
-        subprocess.run(
-            ["git", "commit", "-m", message],
-            cwd=REPO_DIR, check=True, capture_output=True
-        )
-        subprocess.run(
-            ["git", "push", "origin", "main"],
-            cwd=REPO_DIR, check=True, capture_output=True
-        )
-        return True
-    except subprocess.CalledProcessError as e:
-        print(f"[git] Erreur push: {e}", file=sys.stderr)
-        return False
 
 def git_last_commit_for_file(filepath: str) -> str | None:
     """Retourne le hash du dernier commit qui a modifié ce fichier."""
@@ -501,14 +483,8 @@ def main():
         if c.get("auto_fix") and c.get("fixes_applied"):
             all_fixes.extend(c["fixes_applied"])
 
-    # Push GitHub si des fixes ont été appliqués
+    # Aucune opération git automatique : les corrections restent à relire.
     git_pushed = False
-    if all_fixes:
-        fixes_summary = "; ".join(all_fixes[:3])
-        git_pushed = git_commit_push(
-            f"security: auto-fix audit hebdomadaire\n\n" +
-            "\n".join(f"- {f}" for f in all_fixes)
-        )
 
     # Problèmes nécessitant une escalade humaine
     escalades = [
@@ -516,6 +492,12 @@ def main():
         for c in checks
         if c.get("escalade") and c.get("escalade_reason")
     ]
+    if all_fixes:
+        escalades.append({
+            "check": "auto_fix",
+            "reason": "Corrections appliquées localement mais non commitées : "
+                      "relire `git diff` puis committer manuellement.",
+        })
 
     # Statut global
     fails   = [c for c in checks if c["status"] == "FAIL"]

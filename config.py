@@ -45,7 +45,7 @@ class BotConfig:
     position_size_fraction: float  # fallback
 
     # Order execution
-    fill_buffer: float
+    ask_buffer: float  # montant offert au-dessus du meilleur vendeur
     order_type: str  # "FOK", "GTC", "FAK"
 
     # Kelly sizing
@@ -90,7 +90,7 @@ class BotConfig:
             high_confidence_size=float(os.environ.get("HIGH_CONFIDENCE_SIZE", "0.30")),
             medium_confidence_size=float(os.environ.get("MEDIUM_CONFIDENCE_SIZE", "0.20")),
             position_size_fraction=float(os.environ.get("POSITION_SIZE_FRACTION", "0.40")),
-            fill_buffer=float(os.environ.get("FILL_BUFFER", "0.10")),
+            ask_buffer=float(os.environ.get("ASK_BUFFER", "0.02")),
             order_type=os.environ.get("ORDER_TYPE", "FOK").upper(),
             kelly_fraction=float(os.environ.get("KELLY_FRACTION", "0.50")),
             max_kelly_size=float(os.environ.get("MAX_KELLY_SIZE", "0.20")),

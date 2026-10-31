@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+import math
+
 from web3 import Web3
 
 from config import BotConfig
@@ -81,6 +84,45 @@ def compute_kelly_size(
     return f_full * kelly_fraction
 
 
+POLY_MIN_SHARES = 5  # Polymarket impose un minimum de 5 parts par ordre
+
+
+def compute_order_shares(
+    amount_usdc: float,
+    offer_price: float,
+    balance: float,
+    max_fraction: float,
+    min_shares: int = POLY_MIN_SHARES,
+) -> int:
+    """Nombre entier de parts à acheter, ou 0 si l'ordre doit être sauté.
+
+    Le coût total (parts × prix offert) ne dépasse jamais ``balance × max_fraction``,
+    le plafond de risque du mode courant. Si la mise Kelly donne moins que le
+    minimum de Polymarket, on ne monte à ``min_shares`` que si ce minimum reste
+    sous le plafond ; sinon on saute le trade plutôt que de surmiser.
+    """
+    if offer_price <= 0 or offer_price >= 1 or balance <= 0 or max_fraction <= 0:
+        return 0
+    budget = min(amount_usdc, balance * max_fraction)
+    # Petite tolérance pour les arrondis en virgule flottante (0.6 / 0.12 = 4.999…)
+    size = int(math.floor(budget / offer_price + 1e-9))
+    if size >= min_shares:
+        return size
+    if min_shares * offer_price <= balance * max_fraction + 1e-9:
+        return min_shares
+    return 0
+
+
+def compute_offer_price(price: float, best_ask: float, ask_buffer: float,
+                        max_buy_price: float) -> float:
+    """Prix offert : max(best_ask, prix du marché) + ask_buffer, arrondi au cent
+    supérieur et plafonné à max_buy_price."""
+    anchor = best_ask if best_ask > price else price
+    # round() avant ceil() : (0.40 + 0.02) * 100 = 42.000000000000004 en flottant
+    cents = math.ceil(round((anchor + ask_buffer) * 100, 6))
+    return min(cents / 100, max_buy_price)
+
+
 class WalletManager:
     def __init__(self, config: BotConfig, clob_client=None, w3: Web3 | None = None):
         self._config = config
@@ -103,13 +145,14 @@ class WalletManager:
                 usdc_e = self._w3.eth.contract(
                     address=Web3.to_checksum_address(USDC_E), abi=BALANCE_ABI,
                 )
-                self._cached_balance = usdc_e.functions.balanceOf(wallet).call() / 1e6
+                raw = await asyncio.to_thread(usdc_e.functions.balanceOf(wallet).call)
+                self._cached_balance = raw / 1e6
             except Exception as e:
                 log.error("Failed to fetch on-chain USDC.e balance: %s", e)
                 self._cached_balance = self._cached_balance or 0.0
         elif self._client:
             try:
-                raw = self._client.get_balance_allowance(asset_type=0)
+                raw = await asyncio.to_thread(self._client.get_balance_allowance, asset_type=0)
                 balance_wei = int(raw.get("balance", "0"))
                 self._cached_balance = balance_wei / 1e6
             except Exception as e:
@@ -129,7 +172,8 @@ class WalletManager:
             usdc_native = self._w3.eth.contract(
                 address=Web3.to_checksum_address(USDC_NATIVE), abi=BALANCE_ABI,
             )
-            return usdc_native.functions.balanceOf(wallet).call() / 1e6
+            raw = await asyncio.to_thread(usdc_native.functions.balanceOf(wallet).call)
+            return raw / 1e6
         except Exception as e:
             log.error("Failed to fetch native USDC balance: %s", e)
             return 0.0

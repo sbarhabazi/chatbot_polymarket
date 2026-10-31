@@ -22,9 +22,10 @@ from pathlib import Path
 from typing import Optional
 
 from logger import log
+from paths import data_path
 
-LEARNED_PARAMS_FILE = os.environ.get("LEARNED_PARAMS_FILE", "learned_params.json")
-TRADE_HISTORY_FILE = os.environ.get("TRADE_HISTORY_FILE", "trade_history.json")
+LEARNED_PARAMS_FILE = os.environ.get("LEARNED_PARAMS_FILE", data_path("learned_params.json"))
+TRADE_HISTORY_FILE = os.environ.get("TRADE_HISTORY_FILE", data_path("trade_history.json"))
 
 # Minimum de trades par bucket avant de faire confiance aux données
 MIN_TRADES_FOR_CALIBRATION = 15
@@ -132,6 +133,24 @@ class LearningEngine:
         log.info("LearningEngine: trade recorded (window=%d, dist=$%.1f, conf=%.2f)",
                  trade.window_ts, trade.btc_distance, trade.confidence)
 
+    def discard_pending_trade(self, window_ts: int) -> bool:
+        """Retire un trade jamais exécuté (ordre GTC annulé sans remplissage, etc.).
+
+        Seul un trade encore en attente (``won is None``) est retiré : un résultat
+        déjà enregistré n'est jamais effacé. Retourne True si un trade a été retiré.
+        """
+        for i, record in enumerate(self._history):
+            if record["window_ts"] == window_ts and record["won"] is None:
+                del self._history[i]
+                self._save_history()
+                log.info("LearningEngine: pending trade discarded (window=%d, never filled)",
+                         window_ts)
+                return True
+        return False
+
+    def has_pending_trade(self, window_ts: int) -> bool:
+        return any(r["window_ts"] == window_ts and r["won"] is None for r in self._history)
+
     def record_result(self, window_ts: int, won: bool, payout: float = 0.0) -> None:
         """
         Enregistre le résultat d'un trade après résolution.
@@ -175,10 +194,12 @@ class LearningEngine:
         if bucket not in table:
             return 0.0
 
-        row = table[bucket]
+        # Clés entières en mémoire (table par défaut, recalibrée) mais chaînes
+        # après un passage par JSON : on normalise avant de lire.
+        row = {int(k): v for k, v in table[bucket].items()}
         # Interpolation linéaire entre les colonnes
-        cols = sorted([int(k) for k in row.keys()], reverse=True)
-        vals = [row[str(c)] for c in cols]
+        cols = sorted(row.keys(), reverse=True)
+        vals = [row[c] for c in cols]
 
         t = seconds_remaining
         if t >= cols[0]:

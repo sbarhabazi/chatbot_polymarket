@@ -3,10 +3,14 @@ Balance Guard — Process D
 
 Surveille le solde USDC.e en continu et gère trois états :
 
-  NORMAL   (solde >= 15$) : trading standard, Kelly fractionné
-  SURVIE   (solde < 15$)  : trading agressif, Full Kelly plafonné 50%
-  DERNIER  (solde < 3$)   : all-in sur conf >= 0.80 seulement
+  NORMAL   (solde >= 15$) : trading standard, demi-Kelly plafonné 20 %
+  SURVIE   (solde < 15$)  : trading prudent, quart de Kelly plafonné 10 %,
+                            confiance minimale relevée
+  DERNIER  (solde < 3$)   : plus aucun nouvel ordre (capital préservé)
   RUINE    (solde < 0.50$): arrêt du bot + alerte pour recharger
+
+Plus le capital baisse, plus le risque par trade baisse : un solde réduit
+n'est jamais une raison de miser une plus grande part de ce qui reste.
 
 Le guard écrit l'état courant dans un fichier partagé lu par le sniper.
 À solde nul, il déclenche l'arrêt propre du process principal via l'event
@@ -26,9 +30,10 @@ from web3 import Web3
 
 from contracts.addresses import USDC_E
 from logger import log
+from paths import data_path
 
-STATE_FILE   = "balance_guard_state.json"
-SENTINEL_FILE = "RUINE_ATTENTE_RECHARGE"
+STATE_FILE   = data_path("balance_guard_state.json")
+SENTINEL_FILE = data_path("RUINE_ATTENTE_RECHARGE")
 
 BALANCE_ABI = [{
     "name": "balanceOf", "type": "function",
@@ -39,32 +44,32 @@ BALANCE_ABI = [{
 
 # Seuils
 THRESHOLD_NORMAL   = 15.0   # >= 15$ → mode normal
-THRESHOLD_SURVIE   = 3.0    # >= 3$ et < 15$ → mode survie (full kelly 50%)
-THRESHOLD_DERNIER  = 0.50   # >= 0.50$ et < 3$ → mode dernier recours (all-in conf >= 0.80)
+THRESHOLD_SURVIE   = 3.0    # >= 3$ et < 15$ → mode survie (quart de Kelly, cap 10 %)
+THRESHOLD_DERNIER  = 0.50   # >= 0.50$ et < 3$ → plus de nouvel ordre
 # < 0.50$ → RUINE → arrêt + alerte
 
 # Maximum Kelly size par mode
 KELLY_CAP = {
     "NORMAL":  0.20,   # 20% max
-    "SURVIE":  0.50,   # 50% max
-    "DERNIER": 1.00,   # 100% (all-in)
+    "SURVIE":  0.10,   # 10% max
+    "DERNIER": 0.00,   # aucun nouvel ordre
     "RUINE":   0.00,   # rien
 }
 
 # Fraction Kelly par mode
 KELLY_FRACTION = {
     "NORMAL":  0.50,   # Half-Kelly
-    "SURVIE":  1.00,   # Full Kelly
-    "DERNIER": 1.00,   # Full Kelly
+    "SURVIE":  0.25,   # Quarter-Kelly
+    "DERNIER": 0.00,
     "RUINE":   0.00,
 }
 
 # Confiance minimale par mode
 MIN_CONFIDENCE = {
     "NORMAL":  0.60,
-    "SURVIE":  0.65,
-    "DERNIER": 0.80,   # All-in seulement sur signaux très forts
-    "RUINE":   1.00,   # Jamais
+    "SURVIE":  0.70,
+    "DERNIER": 1.01,   # Jamais (confiance plafonnée à 0.98)
+    "RUINE":   1.01,   # Jamais
 }
 
 
@@ -133,25 +138,39 @@ class BalanceGuard:
             return "RUINE"
 
     @staticmethod
+    def params_for_mode(mode: str) -> dict:
+        """Paramètres de risque d'un mode, toujours tirés des tables ci-dessus."""
+        if mode not in KELLY_CAP:
+            mode = "NORMAL"
+        return {
+            "mode": mode,
+            "kelly_cap": KELLY_CAP[mode],
+            "kelly_fraction": KELLY_FRACTION[mode],
+            "min_confidence": MIN_CONFIDENCE[mode],
+        }
+
+    @staticmethod
     def read_current_mode() -> dict:
-        """Appelé par le Sniper pour connaître le mode actuel."""
+        """Appelé par le Sniper pour connaître le mode actuel.
+
+        Seul le nom du mode est lu dans le fichier d'état : les plafonds viennent
+        du code, pour qu'un fichier écrit par une ancienne version (ex. cap 100 %)
+        ne puisse pas réactiver des paramètres plus risqués.
+        """
+        mode = "NORMAL"
         try:
             if Path(STATE_FILE).exists():
                 with open(STATE_FILE) as f:
-                    return json.load(f)
+                    mode = json.load(f).get("mode", "NORMAL")
         except Exception:
             pass
-        # Defaults si le fichier n'existe pas encore
-        return {
-            "mode": "NORMAL",
-            "kelly_cap": 0.20,
-            "kelly_fraction": 0.50,
-            "min_confidence": 0.60,
-        }
+        return BalanceGuard.params_for_mode(mode)
 
     async def get_balance(self) -> float:
         try:
-            raw = self._contract.functions.balanceOf(self._wallet).call()
+            raw = await asyncio.to_thread(
+                self._contract.functions.balanceOf(self._wallet).call
+            )
             return raw / 1e6
         except Exception as e:
             log.warning("BalanceGuard: lecture solde échouée: %s", e)
@@ -216,15 +235,15 @@ class BalanceGuard:
         elif new_mode == "DERNIER":
             log.warning(
                 "BalanceGuard: MODE DERNIER RECOURS — solde=$%.2f | "
-                "all-in autorisé sur conf >= %.0f%%",
-                balance, MIN_CONFIDENCE["DERNIER"] * 100,
+                "aucun nouvel ordre, recharge recommandée",
+                balance,
             )
 
         # ─── SURVIE ───────────────────────────────────────────────
         elif new_mode == "SURVIE":
             log.info(
                 "BalanceGuard: MODE SURVIE — solde=$%.2f | "
-                "Full Kelly, cap 50%%",
+                "quart de Kelly, cap 10%%",
                 balance,
             )
 

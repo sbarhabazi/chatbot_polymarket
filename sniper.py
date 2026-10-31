@@ -13,7 +13,14 @@ from logger import log
 from market_manager import MarketManager, compute_window_timestamp
 from models import MarketInfo
 from price_analyzer import PriceAnalyzer
-from wallet_manager import WalletManager, calculate_net_yield, compute_kelly_size
+from wallet_manager import (
+    POLY_MIN_SHARES,
+    WalletManager,
+    calculate_net_yield,
+    compute_kelly_size,
+    compute_offer_price,
+    compute_order_shares,
+)
 
 
 class Sniper:
@@ -46,6 +53,7 @@ class Sniper:
         self._order_lock = asyncio.Lock()
         self._order_pending_window: int | None = None
         self._active_gtc_order_id: str | None = None  # Pour annulation si non rempli
+        self._active_gtc_context: tuple[str, float] | None = None  # (côté, priceToBeat)
 
         # Chainlink oracle (same source Polymarket uses for resolution)
         self._chainlink = None
@@ -104,7 +112,7 @@ class Sniper:
                                 current_window, self._pa._active_source, live_price, remaining)
                 else:
                     # Priority 3: Chainlink (least accurate)
-                    self._chainlink_open_price = self._get_chainlink_price()
+                    self._chainlink_open_price = await self._get_chainlink_price()
                     self._price_source = "chainlink"
                     if self._chainlink_open_price:
                         log.warning("Window %d Chainlink: $%.2f (LEAST RELIABLE, %.0fs left)",
@@ -334,72 +342,17 @@ class Sniper:
                 )
             return False
 
-        # Determine token and price
-        chosen_side = signal.recommended_side
-        if chosen_side == "Up":
-            token_id = market.up_token_id
-            share_price = market.up_price
-        else:
-            token_id = market.down_token_id
-            share_price = market.down_price
+        # Determine token and price.
+        # On joue uniquement le côté recommandé par le signal : si ce côté est trop
+        # cher pour le capital, on saute la fenêtre (plus de bascule vers le côté opposé).
+        side = signal.recommended_side
+        token_id = market.up_token_id if side == "Up" else market.down_token_id
+        share_price = market.up_price if side == "Up" else market.down_price
 
         # Refresh prices
         refreshed = await self._mm.get_market_by_window_ts(market.window_ts)
         if refreshed and refreshed.accepting_orders:
-            if chosen_side == "Up":
-                share_price = refreshed.up_price
-            else:
-                share_price = refreshed.down_price
-
-        # Check 6: Affordability — si le côté recommandé coûte trop cher (> 99% solde pour 5 parts)
-        # et que le côté opposé est accessible, essayer l'opposé si le signal est assez fort
-        balance_now = await self._wm.get_usdc_balance(force_refresh=True)
-        offer_price_check = min(
-            (share_price + 0.02 + self._config.fill_buffer),
-            self._config.max_buy_price
-        )
-        min_required = 5 * offer_price_check
-        if min_required > balance_now * 0.99 and refreshed:
-            # Côté recommandé hors de portée — essayer l'opposé
-            if chosen_side == "Up":
-                alt_price = refreshed.down_price
-                alt_token_id = market.down_token_id
-                alt_side = "Down"
-            else:
-                alt_price = refreshed.up_price
-                alt_token_id = market.up_token_id
-                alt_side = "Up"
-
-            alt_offer = min(alt_price + 0.02 + self._config.fill_buffer, self._config.max_buy_price)
-            alt_required = 5 * alt_offer
-
-            # GARDE-FOU: ne jamais flipper vers un prix < $0.15/part
-            # (marché quasi-résolu, probabilité de gain proche de zéro)
-            ALT_MIN_PRICE = 0.15
-            if alt_required <= balance_now * 0.99 and alt_price >= ALT_MIN_PRICE and alt_price <= self._config.max_buy_price:
-                log.info(
-                    "Capital bas ($%.2f) — côté %s trop cher ($%.2f/part, need $%.2f). "
-                    "Bascule vers %s @ $%.3f/part",
-                    balance_now, chosen_side, share_price, min_required,
-                    alt_side, alt_price,
-                )
-                chosen_side = alt_side
-                token_id = alt_token_id
-                share_price = alt_price
-                if refreshed:
-                    best_ask_alt = refreshed.best_ask if refreshed.best_ask > 0 and chosen_side == signal.recommended_side else alt_price
-            else:
-                if alt_price < ALT_MIN_PRICE:
-                    log.warning(
-                        "SKIP capital: côté alternatif ($%.3f/part) trop bas — marché quasi-résolu, skip",
-                        alt_price,
-                    )
-                else:
-                    log.warning(
-                        "SKIP capital: les deux côtés hors de portée ($%.2f) — Up=$%.3f, Down=$%.3f",
-                        balance_now, refreshed.up_price if refreshed else 0, refreshed.down_price if refreshed else 0,
-                    )
-                return False
+            share_price = refreshed.up_price if side == "Up" else refreshed.down_price
 
         net_yield = calculate_net_yield(share_price)
 
@@ -420,15 +373,19 @@ class Sniper:
         # Check 8: Adaptive position sizing via BalanceGuard
         balance = await self._wm.get_usdc_balance(force_refresh=True)
 
-        # Lire le mode courant depuis le BalanceGuard
+        # Lire le mode courant depuis le BalanceGuard (plafonds tirés du code)
         guard_state = BalanceGuard.read_current_mode()
-        mode_label   = guard_state.get("mode", "NORMAL")
-        kelly_cap    = guard_state.get("kelly_cap", 0.20)
-        kelly_frac   = guard_state.get("kelly_fraction", 0.50)
-        min_conf     = guard_state.get("min_confidence", 0.60)
+        mode_label   = guard_state["mode"]
+        kelly_cap    = guard_state["kelly_cap"]
+        kelly_frac   = guard_state["kelly_fraction"]
+        min_conf     = guard_state["min_confidence"]
 
         # Plancher absolu: $0.50
         abs_min_bet = 0.50
+
+        if kelly_cap <= 0 or kelly_frac <= 0:
+            log.info("SKIP: mode %s — aucun nouvel ordre (solde=$%.2f)", mode_label, balance)
+            return False
 
         # Vérification de confiance minimale selon le mode
         if signal.confidence < min_conf:
@@ -472,32 +429,6 @@ class Sniper:
             )
             return False
 
-        # Marquer que l'on tente un ordre dans cette fenêtre
-        # (même si l'API rejette, on ne réessaiera pas cette fenêtre)
-        self._order_attempted_this_window = True
-
-        log.info(
-            "BUY [%s/%s]: %s | $%.2f (kelly=%.1f%% of $%.2f) @ $%.3f | "
-            "yield=%.1f%% | dist=$%.1f | signals=%d/%d%s",
-            tier, mode_label, chosen_side, bet_amount, size_fraction * 100,
-            balance, share_price, net_yield * 100, signal.btc_distance,
-            signal.signal_agreement, signal.signal_total,
-            " [FLIPPED]" if chosen_side != signal.recommended_side else "",
-        )
-
-        # Enregistrer le trade dans le learning engine
-        trade_record = TradeRecord(
-            window_ts=market.window_ts,
-            side=chosen_side,
-            btc_distance=signal.btc_distance,
-            seconds_remaining=remaining,
-            confidence=signal.confidence,
-            share_price=share_price,
-            amount_usdc=bet_amount,
-            source="paper" if self._config.paper_trading else "live",
-        )
-        self._le.record_trade(trade_record)
-
         # Execute (guarded by lock to prevent double-trade)
         current_window = market.window_ts
         if self._order_pending_window == current_window:
@@ -516,11 +447,23 @@ class Sniper:
 
             self._order_pending_window = current_window
 
+            # Marquer que l'on tente un ordre dans cette fenêtre
+            # (même si l'API rejette, on ne réessaiera pas cette fenêtre)
+            self._order_attempted_this_window = True
+
+            log.info(
+                "BUY [%s/%s]: %s | $%.2f (kelly=%.1f%% of $%.2f, cap=%.0f%%) @ $%.3f | "
+                "yield=%.1f%% | dist=$%.1f | signals=%d/%d",
+                tier, mode_label, side, bet_amount, size_fraction * 100,
+                balance, kelly_cap * 100, share_price, net_yield * 100, signal.btc_distance,
+                signal.signal_agreement, signal.signal_total,
+            )
+
             if self._config.paper_trading:
                 shares = bet_amount / share_price
                 trade = {
                     "window": market.window_ts,
-                    "side": signal.recommended_side,
+                    "side": side,
                     "price": share_price,
                     "amount": bet_amount,
                     "shares": shares,
@@ -533,77 +476,116 @@ class Sniper:
                 self._paper_trades.append(trade)
                 self._wm.paper_deduct(bet_amount)
                 self._last_traded_window = compute_window_timestamp()
+                self._record_trade(market, side, signal, remaining, share_price, bet_amount)
                 log.info(
                     "PAPER BUY OK: %.1f shares @ $%.3f | payout=$%.2f | trades=%d | bal=$%.2f",
                     shares, share_price, shares, len(self._paper_trades),
                     await self._wm.get_usdc_balance(),
                 )
                 return True
+
+            # Gamma `bestAsk` est celui du premier token (Up) : ne pas l'appliquer à Down.
+            if side == "Up" and refreshed and refreshed.best_ask > 0:
+                best_ask = refreshed.best_ask
             else:
-                # Pass best_ask from refreshed market for tighter pricing
-                # Note: best_ask from CLOB is for the token we're buying
-                # If we flipped sides, best_ask of the original side doesn't apply
-                if refreshed and refreshed.best_ask > 0 and chosen_side == signal.recommended_side:
-                    best_ask = refreshed.best_ask
-                else:
-                    best_ask = share_price  # Use market price directly if flipped
-                success = await self._place_limit_buy(token_id, bet_amount, share_price, signal.confidence, best_ask=best_ask)
-                if success:
-                    self._last_traded_window = compute_window_timestamp()
-                    self._wm.invalidate_cache()
-                    log.info(
-                        "ORDER ACCEPTED (scan #%d) | %s @ $%.3f | yield=%.1f%%",
-                        scan_count, signal.recommended_side, share_price, net_yield * 100,
-                    )
-                    return True
-                else:
-                    self._order_pending_window = None
-                    log.warning("Order failed at scan #%d", scan_count)
-                    return False
+                best_ask = share_price
+            placed = await self._place_limit_buy(
+                token_id, bet_amount, share_price, signal.confidence,
+                best_ask=best_ask, balance=balance, max_fraction=kelly_cap,
+            )
+            if placed is None:
+                self._order_pending_window = None
+                log.warning("Order failed at scan #%d", scan_count)
+                return False
+
+            committed_usdc, offer_price = placed
+            if self._active_gtc_order_id:
+                self._active_gtc_context = (side, price_to_beat)
+            self._last_traded_window = compute_window_timestamp()
+            self._wm.invalidate_cache()
+            # Le trade n'entre dans l'historique d'apprentissage qu'une fois accepté
+            # par le CLOB, avec le montant et le prix réellement engagés.
+            self._record_trade(market, side, signal, remaining, offer_price, committed_usdc)
+            log.info(
+                "ORDER ACCEPTED (scan #%d) | %s $%.2f @ $%.3f | yield=%.1f%%",
+                scan_count, side, committed_usdc, offer_price, net_yield * 100,
+            )
+            return True
+
+    def _record_trade(self, market: MarketInfo, side: str, signal, seconds_remaining: float,
+                      share_price: float, amount_usdc: float) -> None:
+        self._le.record_trade(TradeRecord(
+            window_ts=market.window_ts,
+            side=side,
+            btc_distance=signal.btc_distance,
+            seconds_remaining=seconds_remaining,
+            confidence=signal.confidence,
+            share_price=share_price,
+            amount_usdc=amount_usdc,
+            source="paper" if self._config.paper_trading else "live",
+        ))
+
+    GTC_REVERSAL_CANCEL_USD = 30.0  # BTC de l'autre côté du priceToBeat de plus de 30 $
+    GTC_CHECK_INTERVAL = 10.0
+    GTC_FINAL_CANCEL_SECONDS = 15.0  # annuler un ordre non rempli à 15 s de la fin
 
     async def _monitor_gtc_order(self, remaining_seconds: float) -> None:
-        """Surveille un ordre GTC actif et l'annule si le marche tourne contre nous.
+        """Surveille un ordre GTC encore dans le carnet jusqu'à la fin de la fenêtre.
 
-        Logique:
-        - Toutes les 10s, regarder le prix BTC actuel vs price_to_beat
-        - Si la direction s'inverse et la distance depasse 30$, annuler l'ordre
-        - Si < 15s restantes et ordre non rempli, annuler pour recuperer les fonds
+        Toutes les 10 s, l'ordre est annulé :
+        - si BTC est passé de l'autre côté du priceToBeat de plus de 30 $
+          (le pari n'est plus soutenu par le signal) ;
+        - s'il reste 15 s ou moins, pour récupérer les fonds d'un ordre non rempli.
+        Un ordre annulé sans aucun remplissage est retiré de l'historique par le
+        Harvester (aucun token détenu).
         """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.0, remaining_seconds)
+
         if not self._active_gtc_order_id or not self._client:
-            await asyncio.sleep(max(0, remaining_seconds))
+            await asyncio.sleep(max(0.0, remaining_seconds))
             return
 
         order_id = self._active_gtc_order_id
+        side, price_to_beat = self._active_gtc_context or (None, None)
         self._active_gtc_order_id = None
-        deadline = remaining_seconds
-        elapsed = 0
-        CHECK_INTERVAL = 10
+        self._active_gtc_context = None
 
-        log.info("GTC monitor: suivre ordre %s (%.0fs restantes)", order_id[:16], deadline)
+        log.info("GTC monitor: suivre ordre %s (%.0fs restantes)", order_id[:16], remaining_seconds)
 
-        while elapsed < deadline - 5:
-            await asyncio.sleep(min(CHECK_INTERVAL, max(1, deadline - elapsed - 5)))
-            elapsed += CHECK_INTERVAL
-
-            time_left = deadline - elapsed
-            if time_left <= 15:
-                # Derniere chance: annuler pour recuperer les fonds
+        while True:
+            time_left = deadline - loop.time()
+            if time_left <= self.GTC_FINAL_CANCEL_SECONDS:
                 log.warning(
                     "GTC monitor: %.0fs restantes, annulation preventive ordre %s",
                     time_left, order_id[:16],
                 )
                 await self._cancel_order(order_id)
-                return
+                break
 
-        # Attendre la fin de la fenetre
-        remaining = deadline - elapsed
+            btc = self._pa.get_current_price()
+            if btc is not None and side and price_to_beat:
+                against = (price_to_beat - btc) if side == "Up" else (btc - price_to_beat)
+                if against > self.GTC_REVERSAL_CANCEL_USD:
+                    log.warning(
+                        "GTC monitor: BTC $%.2f a franchi le priceToBeat $%.2f contre %s "
+                        "(-$%.0f) — annulation ordre %s",
+                        btc, price_to_beat, side, against, order_id[:16],
+                    )
+                    await self._cancel_order(order_id)
+                    break
+
+            await asyncio.sleep(min(self.GTC_CHECK_INTERVAL,
+                                    max(0.01, time_left - self.GTC_FINAL_CANCEL_SECONDS)))
+
+        remaining = deadline - loop.time()
         if remaining > 0:
             await asyncio.sleep(remaining)
 
     async def _cancel_order(self, order_id: str) -> bool:
         """Annule un ordre GTC dans le carnet."""
         try:
-            resp = self._client.cancel(order_id)
+            resp = await asyncio.to_thread(self._client.cancel, order_id)
             log.info("GTC annule: %s | reponse: %s", order_id[:16], resp)
             self._wm.invalidate_cache()
             return True
@@ -611,25 +593,39 @@ class Sniper:
             log.warning("GTC annulation echouee (%s): %s", order_id[:16], e)
             return False
 
-    async def _place_limit_buy(self, token_id: str, amount_usdc: float, price: float, confidence: float = 0.65, best_ask: float = 0.0) -> bool:
+    async def _place_limit_buy(
+        self,
+        token_id: str,
+        amount_usdc: float,
+        price: float,
+        confidence: float = 0.65,
+        best_ask: float = 0.0,
+        balance: float = 0.0,
+        max_fraction: float = 0.0,
+    ) -> tuple[float, float] | None:
         """Place a buy order priced just above best_ask for reliable fills.
 
-        Strategy: offer best_ask + small fixed buffer ($0.02) to get priority
-        in the order book without overpaying. Confidence bonus capped at $0.03.
+        Strategy: offer max(best_ask, price) + ASK_BUFFER (default $0.02) to get
+        priority in the order book without overpaying.
 
         Args:
             token_id: The Polymarket token ID
-            amount_usdc: USDC to spend
-            price: Market mid price per share (e.g. 0.50 = $0.50/share)
+            amount_usdc: USDC to spend (Kelly sizing)
+            price: Market price per share (e.g. 0.50 = $0.50/share)
             confidence: Signal confidence (0-1)
-            best_ask: Best ask price from order book (used as base for offer)
+            best_ask: Best ask of THIS token (used as base for offer)
+            balance: Current USDC.e balance
+            max_fraction: Risk cap of the current mode; total cost never exceeds
+                balance * max_fraction, even to reach Polymarket's 5-share minimum
+
+        Returns:
+            (USDC committed, offer price) when the order was matched or rests in
+            the book, None when nothing was placed.
         """
         try:
             from py_clob_client.clob_types import OrderArgs, OrderType
             from py_clob_client.order_builder.constants import BUY
-            import math
 
-            base_buffer = self._config.fill_buffer
             order_type_str = self._config.order_type
 
             # Map string to OrderType enum
@@ -641,45 +637,31 @@ class Sniper:
             }
             order_type = order_type_map.get(order_type_str, OrderType.FOK)
 
-            # Price just above best_ask for reliable fills.
-            # Use best_ask as anchor if available; fallback to mid price.
-            # Small fixed buffer ($0.02) to get order book priority.
-            # Tiny confidence bonus (max $0.03) — don't overpay vs. market.
-            ask_anchor = best_ask if best_ask > price else price
-            confidence_bonus = min(max(0, (confidence - 0.60)) * 0.075, 0.03)
-            fill_buffer = base_buffer + confidence_bonus
-            offer_price = min(math.ceil((ask_anchor + 0.02) * 100) / 100, self._config.max_buy_price)
-            size = int(amount_usdc / offer_price)  # Floor to whole shares
+            # Prix juste au-dessus du meilleur vendeur (ASK_BUFFER) pour être rempli
+            offer_price = compute_offer_price(
+                price, best_ask, self._config.ask_buffer, self._config.max_buy_price,
+            )
 
-            # Polymarket impose un minimum de 5 parts par ordre
-            POLY_MIN_SIZE = 5
-            if size < POLY_MIN_SIZE:
-                # Essayer d'atteindre 5 parts en augmentant le montant
-                # seulement si on a assez de capital
-                required_amount = POLY_MIN_SIZE * offer_price
-                balance_check = await self._wm.get_usdc_balance()
-                if required_amount <= balance_check * 0.99:  # max 99% du solde en mode survie
-                    log.info(
-                        "Ajustement taille: %d → %d parts (minimum Polymarket) | $%.2f → $%.2f",
-                        size, POLY_MIN_SIZE, amount_usdc, required_amount,
-                    )
-                    size = POLY_MIN_SIZE
-                else:
-                    log.warning(
-                        "SKIP: %d parts < minimum 5, fonds insuffisants ($%.2f requis, $%.2f dispo) "
-                        "— ce côté coûte trop cher avec le capital actuel",
-                        size, required_amount, balance_check,
-                    )
-                    return False
+            size = compute_order_shares(amount_usdc, offer_price, balance, max_fraction)
+            if size < POLY_MIN_SHARES:
+                log.warning(
+                    "SKIP: minimum %d parts @ $%.2f = $%.2f dépasse le plafond du mode "
+                    "(%.0f%% de $%.2f = $%.2f)",
+                    POLY_MIN_SHARES, offer_price, POLY_MIN_SHARES * offer_price,
+                    max_fraction * 100, balance, balance * max_fraction,
+                )
+                return None
+            if size * offer_price > amount_usdc + 0.01:
+                log.info(
+                    "Ajustement taille au minimum Polymarket: %d parts | $%.2f → $%.2f",
+                    size, amount_usdc, size * offer_price,
+                )
 
-            if size < 1:
-                log.warning("Order size too small: %d shares at $%.2f", size, offer_price)
-                return False
-
+            committed = round(size * offer_price, 2)
             log.info(
-                "%s ORDER: %d shares @ $%.2f (market=$%.2f +$%.2f buf [base=$%.2f +conf=$%.2f]) = $%.2f",
-                order_type_str, size, offer_price, price, fill_buffer,
-                base_buffer, confidence_bonus, size * offer_price,
+                "%s ORDER: %d shares @ $%.2f (market=$%.2f, ask=$%.2f, +$%.2f buffer) = $%.2f",
+                order_type_str, size, offer_price, price, best_ask,
+                self._config.ask_buffer, committed,
             )
 
             order_args = OrderArgs(
@@ -688,8 +670,9 @@ class Sniper:
                 size=size,
                 side=BUY,
             )
-            signed_order = self._client.create_order(order_args)
-            response = self._client.post_order(signed_order, order_type)
+            # Appels HTTP synchrones : exécutés hors de la boucle asyncio
+            signed_order = await asyncio.to_thread(self._client.create_order, order_args)
+            response = await asyncio.to_thread(self._client.post_order, signed_order, order_type)
 
             if isinstance(response, dict):
                 status = response.get("status", "")
@@ -705,7 +688,11 @@ class Sniper:
                         "%s FILLED: paid $%s for %s shares (offered $%.2f)",
                         order_type_str, making, taking, offer_price,
                     )
-                    return True
+                    try:
+                        paid = float(making) if making else committed
+                    except (ValueError, TypeError):
+                        paid = committed
+                    return (paid if paid > 0 else committed), offer_price
                 elif status == "live":
                     # GTC: order is in the book, waiting for sellers.
                     # Stocker l'order_id pour pouvoir l'annuler si non rempli
@@ -724,34 +711,34 @@ class Sniper:
                             "%s order PLACED in book @ $%.2f (waiting for sellers, may fill before close) | id=%s",
                             order_type_str, offer_price, order_id,
                         )
-                    return True  # Stop scanning — order is live in the book
+                    return committed, offer_price  # Stop scanning — order is live in the book
                 else:
                     log.warning(
                         "%s order status=%s at $%.2f (full response: %s)",
                         order_type_str, status, offer_price, response,
                     )
-                    return False
+                    return None
 
-            log.info("Order response (raw): %s", response)
-            return True
+            # Réponse inattendue : on suppose l'ordre placé pour ne pas le doubler.
+            # Si rien n'a été rempli, le Harvester retirera le trade de l'historique.
+            log.warning("Order response (raw, unexpected format): %s", response)
+            return committed, offer_price
         except Exception as e:
             err_msg = str(e)
             if "fully filled" in err_msg and "FOK" in err_msg:
                 log.warning("FOK rejected (partial fill available, not enough for full order)")
-                return False
             elif "not enough balance" in err_msg:
                 log.warning("Insufficient balance for order (USDC locked in active orders)")
-                return True  # Stop scanning — no point retrying with same balance
             else:
                 log.error("Order execution error: %s", e, exc_info=True)
-                return False
+            return None
 
-    def _get_chainlink_price(self) -> float | None:
+    async def _get_chainlink_price(self) -> float | None:
         """Get BTC/USD price from Chainlink oracle (same source as Polymarket resolution)."""
         if not self._chainlink:
             return None
         try:
-            data = self._chainlink.functions.latestRoundData().call()
+            data = await asyncio.to_thread(self._chainlink.functions.latestRoundData().call)
             price = data[1] / 1e8  # Chainlink uses 8 decimals
             return price
         except Exception as e:
