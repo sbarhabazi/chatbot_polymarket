@@ -9,6 +9,18 @@ Bot de trading automatique sur Polymarket — marchés BTC 5 minutes "Up or Down
 - **Process C (ProfitTaker):** Transfert automatique de $50 vers le portefeuille personnel quand la balance atteint $100
 - **LearningEngine:** Auto-calibration des seuils et du sizing après chaque trade résolu
 
+## Mode papier et mesure de la stratégie
+
+Avec `PAPER_TRADING=true`, le bot simule chaque trade comme en réel : même prix offert (`ASK_BUFFER`), nombre entier de parts, minimum de 5 parts, plafond du mode calculé sur le solde simulé. L'ordre est supposé rempli au prix offert, ce qui est une hypothèse optimiste. Une minute après la fin de chaque fenêtre, le **PaperResolver** lit le résultat officiel du marché, enregistre gain ou perte dans `trade_history.json` et crédite le solde papier (frais de 7,2 % sur le gain déduits).
+
+Rapport de performance :
+
+```bash
+docker exec polybot python scripts/paper_report.py
+```
+
+Pour chaque tranche de confiance, le rapport compare le taux de gain observé au seuil de rentabilité (le prix moyen payé, frais compris). Une tranche n'est rentable que si elle gagne plus souvent que ce seuil. Il faut au moins 100 à 200 trades résolus avant de conclure.
+
 ## Gestion du risque (BalanceGuard)
 
 | Mode | Solde | Kelly | Plafond par trade | Confiance min. |

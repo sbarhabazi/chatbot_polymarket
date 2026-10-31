@@ -131,6 +131,12 @@ async def main() -> None:
     # Tasks
     tasks_to_run = []
 
+    # Paper mode: résoudre les trades simulés (gain/perte) une fois le marché résolu
+    if config.paper_trading:
+        from paper_resolver import PaperResolver
+        paper_resolver = PaperResolver(market_manager, learning_engine, wallet_manager)
+        tasks_to_run.append(asyncio.create_task(paper_resolver.run(), name="paper_resolver"))
+
     # Harvester only in live mode
     if not config.paper_trading and w3 is not None:
         from harvester import Harvester

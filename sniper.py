@@ -373,8 +373,13 @@ class Sniper:
         # Check 8: Adaptive position sizing via BalanceGuard
         balance = await self._wm.get_usdc_balance(force_refresh=True)
 
-        # Lire le mode courant depuis le BalanceGuard (plafonds tirés du code)
-        guard_state = BalanceGuard.read_current_mode()
+        if self._config.paper_trading:
+            # En papier, le BalanceGuard ne tourne pas : mode tiré du solde simulé
+            # (un fichier d'état laissé par une session réelle ne compte pas).
+            guard_state = BalanceGuard.params_for_mode(BalanceGuard.get_mode_for_balance(balance))
+        else:
+            # Lire le mode courant depuis le BalanceGuard (plafonds tirés du code)
+            guard_state = BalanceGuard.read_current_mode()
         mode_label   = guard_state["mode"]
         kelly_cap    = guard_state["kelly_cap"]
         kelly_frac   = guard_state["kelly_fraction"]
@@ -459,36 +464,47 @@ class Sniper:
                 signal.signal_agreement, signal.signal_total,
             )
 
-            if self._config.paper_trading:
-                shares = bet_amount / share_price
-                trade = {
-                    "window": market.window_ts,
-                    "side": side,
-                    "price": share_price,
-                    "amount": bet_amount,
-                    "shares": shares,
-                    "potential_payout": shares * 1.0,
-                    "btc_price": signal.current_price,
-                    "btc_distance": signal.btc_distance,
-                    "confidence": signal.confidence,
-                    "tier": tier,
-                }
-                self._paper_trades.append(trade)
-                self._wm.paper_deduct(bet_amount)
-                self._last_traded_window = compute_window_timestamp()
-                self._record_trade(market, side, signal, remaining, share_price, bet_amount)
-                log.info(
-                    "PAPER BUY OK: %.1f shares @ $%.3f | payout=$%.2f | trades=%d | bal=$%.2f",
-                    shares, share_price, shares, len(self._paper_trades),
-                    await self._wm.get_usdc_balance(),
-                )
-                return True
-
             # Gamma `bestAsk` est celui du premier token (Up) : ne pas l'appliquer à Down.
             if side == "Up" and refreshed and refreshed.best_ask > 0:
                 best_ask = refreshed.best_ask
             else:
                 best_ask = share_price
+
+            if self._config.paper_trading:
+                # Simulation fidèle au réel : même prix offert, même nombre entier de
+                # parts (minimum 5, plafond du mode). Hypothèse optimiste : l'ordre
+                # est supposé rempli au prix offert.
+                offer_price = compute_offer_price(
+                    share_price, best_ask, self._config.ask_buffer, self._config.max_buy_price,
+                )
+                shares = compute_order_shares(bet_amount, offer_price, balance, kelly_cap)
+                if shares < POLY_MIN_SHARES:
+                    self._order_pending_window = None
+                    log.info("PAPER SKIP: 5 parts @ $%.2f dépassent le plafond du mode", offer_price)
+                    return False
+                cost = round(shares * offer_price, 2)
+                self._paper_trades.append({
+                    "window": market.window_ts,
+                    "side": side,
+                    "price": offer_price,
+                    "amount": cost,
+                    "shares": shares,
+                    "potential_payout": float(shares),
+                    "btc_price": signal.current_price,
+                    "btc_distance": signal.btc_distance,
+                    "confidence": signal.confidence,
+                    "tier": tier,
+                })
+                self._wm.paper_deduct(cost)
+                self._last_traded_window = compute_window_timestamp()
+                self._record_trade(market, side, signal, remaining, offer_price, cost)
+                log.info(
+                    "PAPER BUY OK: %s %d parts @ $%.2f = $%.2f | trades=%d | bal=$%.2f",
+                    side, shares, offer_price, cost, len(self._paper_trades),
+                    await self._wm.get_usdc_balance(),
+                )
+                return True
+
             placed = await self._place_limit_buy(
                 token_id, bet_amount, share_price, signal.confidence,
                 best_ask=best_ask, balance=balance, max_fraction=kelly_cap,
