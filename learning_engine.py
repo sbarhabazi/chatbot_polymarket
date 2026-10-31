@@ -132,6 +132,24 @@ class LearningEngine:
         log.info("LearningEngine: trade recorded (window=%d, dist=$%.1f, conf=%.2f)",
                  trade.window_ts, trade.btc_distance, trade.confidence)
 
+    def discard_pending_trade(self, window_ts: int) -> bool:
+        """Retire un trade jamais exécuté (ordre GTC annulé sans remplissage, etc.).
+
+        Seul un trade encore en attente (``won is None``) est retiré : un résultat
+        déjà enregistré n'est jamais effacé. Retourne True si un trade a été retiré.
+        """
+        for i, record in enumerate(self._history):
+            if record["window_ts"] == window_ts and record["won"] is None:
+                del self._history[i]
+                self._save_history()
+                log.info("LearningEngine: pending trade discarded (window=%d, never filled)",
+                         window_ts)
+                return True
+        return False
+
+    def has_pending_trade(self, window_ts: int) -> bool:
+        return any(r["window_ts"] == window_ts and r["won"] is None for r in self._history)
+
     def record_result(self, window_ts: int, won: bool, payout: float = 0.0) -> None:
         """
         Enregistre le résultat d'un trade après résolution.

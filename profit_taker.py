@@ -22,6 +22,7 @@ from web3.middleware import ExtraDataToPOAMiddleware
 from config import BotConfig
 from contracts.addresses import USDC_E
 from logger import log
+from tx_lock import WALLET_TX_LOCK
 
 PROFIT_HISTORY_FILE = "profit_history.json"
 
@@ -119,7 +120,9 @@ class ProfitTaker:
 
         # Lire le solde actuel
         try:
-            balance_raw = self._usdc_contract.functions.balanceOf(wallet).call()
+            balance_raw = await asyncio.to_thread(
+                self._usdc_contract.functions.balanceOf(wallet).call
+            )
             balance = balance_raw / 1e6
         except Exception as e:
             log.warning("ProfitTaker: failed to read balance: %s", e)
@@ -181,36 +184,41 @@ class ProfitTaker:
 
         for attempt in range(1, 4):
             try:
-                nonce = self._w3.eth.get_transaction_count(from_wallet, "pending")
-                gas_price = int(self._w3.eth.gas_price * (1.5 + attempt * 0.5))
-
-                tx = self._usdc_contract.functions.transfer(
-                    self._personal_wallet,
-                    amount_raw,
-                ).build_transaction({
-                    "chainId": 137,
-                    "from": from_wallet,
-                    "nonce": nonce,
-                    "gasPrice": gas_price,
-                    "gas": 100_000,
-                })
-
-                signed = self._w3.eth.account.sign_transaction(
-                    tx, self._config.private_key
-                )
-                tx_hash = self._w3.eth.send_raw_transaction(signed.raw_transaction)
-                log.info("ProfitTaker: tx sent (attempt %d): %s", attempt, tx_hash.hex())
-
-                receipt = self._w3.eth.wait_for_transaction_receipt(tx_hash, timeout=90)
-                if receipt["status"] == 1:
-                    return True, tx_hash.hex()
-                else:
-                    log.error("ProfitTaker: tx reverted: %s", tx_hash.hex())
-                    return False, tx_hash.hex()
-
+                # Envoi et attente du reçu (jusqu'à 90 s) dans un thread :
+                # la boucle asyncio (Sniper, flux de prix) n'est pas bloquée.
+                async with WALLET_TX_LOCK:
+                    return await asyncio.to_thread(
+                        self._send_transfer_tx, from_wallet, amount_raw, attempt
+                    )
             except Exception as e:
                 log.warning("ProfitTaker: attempt %d failed: %s", attempt, e)
                 if attempt < 3:
                     await asyncio.sleep(5)
 
         return False, "failed_after_3_attempts"
+
+    def _send_transfer_tx(self, from_wallet: str, amount_raw: int, attempt: int) -> tuple[bool, str]:
+        """Synchrone (appelé via asyncio.to_thread)."""
+        nonce = self._w3.eth.get_transaction_count(from_wallet, "pending")
+        gas_price = int(self._w3.eth.gas_price * (1.5 + attempt * 0.5))
+
+        tx = self._usdc_contract.functions.transfer(
+            self._personal_wallet,
+            amount_raw,
+        ).build_transaction({
+            "chainId": 137,
+            "from": from_wallet,
+            "nonce": nonce,
+            "gasPrice": gas_price,
+            "gas": 100_000,
+        })
+
+        signed = self._w3.eth.account.sign_transaction(tx, self._config.private_key)
+        tx_hash = self._w3.eth.send_raw_transaction(signed.raw_transaction)
+        log.info("ProfitTaker: tx sent (attempt %d): %s", attempt, tx_hash.hex())
+
+        receipt = self._w3.eth.wait_for_transaction_receipt(tx_hash, timeout=90)
+        if receipt["status"] == 1:
+            return True, tx_hash.hex()
+        log.error("ProfitTaker: tx reverted: %s", tx_hash.hex())
+        return False, tx_hash.hex()

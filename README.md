@@ -9,6 +9,24 @@ Bot de trading automatique sur Polymarket — marchés BTC 5 minutes "Up or Down
 - **Process C (ProfitTaker):** Transfert automatique de $50 vers le portefeuille personnel quand la balance atteint $100
 - **LearningEngine:** Auto-calibration des seuils et du sizing après chaque trade résolu
 
+## Gestion du risque (BalanceGuard)
+
+| Mode | Solde | Kelly | Plafond par trade | Confiance min. |
+|---|---|---|---|---|
+| NORMAL | ≥ 15 $ | ½ | 20 % | 0,60 |
+| SURVIE | 3 à 15 $ | ¼ | 10 % | 0,70 |
+| DERNIER | 0,50 à 3 $ | — | aucun nouvel ordre | — |
+| RUINE | < 0,50 $ | — | arrêt du bot | — |
+
+Le coût d'un ordre (minimum Polymarket de 5 parts compris) ne dépasse jamais le plafond du mode : si 5 parts coûtent plus, la fenêtre est sautée. Le bot joue uniquement le côté recommandé par le signal.
+
+## Tests
+
+```bash
+pip install -r requirements.txt -r requirements-dev.txt
+python -m pytest tests
+```
+
 ## Infrastructure
 
 - **VPS:** Vultr Madrid (ES) — région autorisée par Polymarket
