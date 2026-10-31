@@ -27,6 +27,9 @@ from paths import data_path
 LEARNED_PARAMS_FILE = os.environ.get("LEARNED_PARAMS_FILE", data_path("learned_params.json"))
 TRADE_HISTORY_FILE = os.environ.get("TRADE_HISTORY_FILE", data_path("trade_history.json"))
 
+# Nombre de trades conservés dans trade_history.json
+HISTORY_MAX_RECORDS = 10_000
+
 # Minimum de trades par bucket avant de faire confiance aux données
 MIN_TRADES_FOR_CALIBRATION = 15
 
@@ -120,7 +123,8 @@ class LearningEngine:
     def _save_history(self) -> None:
         try:
             with open(TRADE_HISTORY_FILE, "w") as f:
-                json.dump(self._history[-500:], f, indent=2)  # garder les 500 derniers
+                # Assez large pour plusieurs semaines de trades (mesure du mode papier)
+                json.dump(self._history[-HISTORY_MAX_RECORDS:], f, indent=2)
         except Exception as e:
             log.error("Failed to save trade history: %s", e)
 
@@ -147,6 +151,11 @@ class LearningEngine:
                          window_ts)
                 return True
         return False
+
+    def pending_trades(self, source: str | None = None) -> list[dict]:
+        """Trades encore sans résultat (optionnellement filtrés par source)."""
+        return [r for r in self._history
+                if r["won"] is None and (source is None or r.get("source") == source)]
 
     def has_pending_trade(self, window_ts: int) -> bool:
         return any(r["window_ts"] == window_ts and r["won"] is None for r in self._history)

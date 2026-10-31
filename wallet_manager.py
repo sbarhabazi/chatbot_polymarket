@@ -34,6 +34,13 @@ def calculate_net_yield(share_price: float, fee_rate: float = 0.072) -> float:
     return (profit - fee) / share_price
 
 
+def paper_payout(shares: float, cost: float, fee_rate: float = 0.072) -> float:
+    """USDC reçus pour une position gagnante : 1 $ par part, moins les frais sur
+    le gain (même taux que calculate_net_yield et compute_kelly_size)."""
+    profit = shares - cost
+    return shares - fee_rate * max(0.0, profit)
+
+
 def compute_kelly_size(
     confidence: float,
     share_price: float,
