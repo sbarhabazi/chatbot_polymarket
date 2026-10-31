@@ -26,11 +26,14 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from learning_engine import LEARNED_PARAMS_FILE as _PARAMS_PATH
+from learning_engine import TRADE_HISTORY_FILE as _HISTORY_PATH
 from learning_engine import LearningEngine
 from logger import log
 
-TRADE_HISTORY_FILE = Path("trade_history.json")
-LEARNED_PARAMS_FILE = Path("learned_params.json")
+# Mêmes fichiers que le LearningEngine (DATA_DIR ou variables d'environnement)
+TRADE_HISTORY_FILE = Path(_HISTORY_PATH)
+LEARNED_PARAMS_FILE = Path(_PARAMS_PATH)
 OPTIMIZE_INTERVAL = 1800  # 30 minutes en secondes
 MIN_TRADES_FOR_FIRST_CALIBRATION = 5
 MIN_NEW_TRADES_TO_TRIGGER = 2

@@ -22,9 +22,10 @@ from web3.middleware import ExtraDataToPOAMiddleware
 from config import BotConfig
 from contracts.addresses import USDC_E
 from logger import log
+from paths import data_path
 from tx_lock import WALLET_TX_LOCK
 
-PROFIT_HISTORY_FILE = "profit_history.json"
+PROFIT_HISTORY_FILE = data_path("profit_history.json")
 
 # ABI minimal pour transfert ERC-20
 TRANSFER_ABI = [

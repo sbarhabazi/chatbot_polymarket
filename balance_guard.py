@@ -30,9 +30,10 @@ from web3 import Web3
 
 from contracts.addresses import USDC_E
 from logger import log
+from paths import data_path
 
-STATE_FILE   = "balance_guard_state.json"
-SENTINEL_FILE = "RUINE_ATTENTE_RECHARGE"
+STATE_FILE   = data_path("balance_guard_state.json")
+SENTINEL_FILE = data_path("RUINE_ATTENTE_RECHARGE")
 
 BALANCE_ABI = [{
     "name": "balanceOf", "type": "function",

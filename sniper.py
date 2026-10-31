@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import math
 
 from web3 import Web3
 
@@ -19,6 +18,7 @@ from wallet_manager import (
     WalletManager,
     calculate_net_yield,
     compute_kelly_size,
+    compute_offer_price,
     compute_order_shares,
 )
 
@@ -53,6 +53,7 @@ class Sniper:
         self._order_lock = asyncio.Lock()
         self._order_pending_window: int | None = None
         self._active_gtc_order_id: str | None = None  # Pour annulation si non rempli
+        self._active_gtc_context: tuple[str, float] | None = None  # (côté, priceToBeat)
 
         # Chainlink oracle (same source Polymarket uses for resolution)
         self._chainlink = None
@@ -498,6 +499,8 @@ class Sniper:
                 return False
 
             committed_usdc, offer_price = placed
+            if self._active_gtc_order_id:
+                self._active_gtc_context = (side, price_to_beat)
             self._last_traded_window = compute_window_timestamp()
             self._wm.invalidate_cache()
             # Le trade n'entre dans l'historique d'apprentissage qu'une fois accepté
@@ -522,41 +525,60 @@ class Sniper:
             source="paper" if self._config.paper_trading else "live",
         ))
 
-    async def _monitor_gtc_order(self, remaining_seconds: float) -> None:
-        """Surveille un ordre GTC actif et l'annule s'il n'est pas rempli avant la fin.
+    GTC_REVERSAL_CANCEL_USD = 30.0  # BTC de l'autre côté du priceToBeat de plus de 30 $
+    GTC_CHECK_INTERVAL = 10.0
+    GTC_FINAL_CANCEL_SECONDS = 15.0  # annuler un ordre non rempli à 15 s de la fin
 
-        Si moins de 15s restent et que l'ordre est encore dans le carnet, il est
-        annulé pour récupérer les fonds. Un ordre annulé sans aucun remplissage
-        est retiré de l'historique par le Harvester (aucun token détenu).
+    async def _monitor_gtc_order(self, remaining_seconds: float) -> None:
+        """Surveille un ordre GTC encore dans le carnet jusqu'à la fin de la fenêtre.
+
+        Toutes les 10 s, l'ordre est annulé :
+        - si BTC est passé de l'autre côté du priceToBeat de plus de 30 $
+          (le pari n'est plus soutenu par le signal) ;
+        - s'il reste 15 s ou moins, pour récupérer les fonds d'un ordre non rempli.
+        Un ordre annulé sans aucun remplissage est retiré de l'historique par le
+        Harvester (aucun token détenu).
         """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.0, remaining_seconds)
+
         if not self._active_gtc_order_id or not self._client:
-            await asyncio.sleep(max(0, remaining_seconds))
+            await asyncio.sleep(max(0.0, remaining_seconds))
             return
 
         order_id = self._active_gtc_order_id
+        side, price_to_beat = self._active_gtc_context or (None, None)
         self._active_gtc_order_id = None
-        deadline = remaining_seconds
-        elapsed = 0
-        CHECK_INTERVAL = 10
+        self._active_gtc_context = None
 
-        log.info("GTC monitor: suivre ordre %s (%.0fs restantes)", order_id[:16], deadline)
+        log.info("GTC monitor: suivre ordre %s (%.0fs restantes)", order_id[:16], remaining_seconds)
 
-        while elapsed < deadline - 5:
-            await asyncio.sleep(min(CHECK_INTERVAL, max(1, deadline - elapsed - 5)))
-            elapsed += CHECK_INTERVAL
-
-            time_left = deadline - elapsed
-            if time_left <= 15:
-                # Derniere chance: annuler pour recuperer les fonds
+        while True:
+            time_left = deadline - loop.time()
+            if time_left <= self.GTC_FINAL_CANCEL_SECONDS:
                 log.warning(
                     "GTC monitor: %.0fs restantes, annulation preventive ordre %s",
                     time_left, order_id[:16],
                 )
                 await self._cancel_order(order_id)
-                return
+                break
 
-        # Attendre la fin de la fenetre
-        remaining = deadline - elapsed
+            btc = self._pa.get_current_price()
+            if btc is not None and side and price_to_beat:
+                against = (price_to_beat - btc) if side == "Up" else (btc - price_to_beat)
+                if against > self.GTC_REVERSAL_CANCEL_USD:
+                    log.warning(
+                        "GTC monitor: BTC $%.2f a franchi le priceToBeat $%.2f contre %s "
+                        "(-$%.0f) — annulation ordre %s",
+                        btc, price_to_beat, side, against, order_id[:16],
+                    )
+                    await self._cancel_order(order_id)
+                    break
+
+            await asyncio.sleep(min(self.GTC_CHECK_INTERVAL,
+                                    max(0.01, time_left - self.GTC_FINAL_CANCEL_SECONDS)))
+
+        remaining = deadline - loop.time()
         if remaining > 0:
             await asyncio.sleep(remaining)
 
@@ -583,8 +605,8 @@ class Sniper:
     ) -> tuple[float, float] | None:
         """Place a buy order priced just above best_ask for reliable fills.
 
-        Strategy: offer best_ask + small fixed buffer ($0.02) to get priority
-        in the order book without overpaying.
+        Strategy: offer max(best_ask, price) + ASK_BUFFER (default $0.02) to get
+        priority in the order book without overpaying.
 
         Args:
             token_id: The Polymarket token ID
@@ -604,7 +626,6 @@ class Sniper:
             from py_clob_client.clob_types import OrderArgs, OrderType
             from py_clob_client.order_builder.constants import BUY
 
-            base_buffer = self._config.fill_buffer
             order_type_str = self._config.order_type
 
             # Map string to OrderType enum
@@ -616,13 +637,10 @@ class Sniper:
             }
             order_type = order_type_map.get(order_type_str, OrderType.FOK)
 
-            # Price just above best_ask for reliable fills.
-            ask_anchor = best_ask if best_ask > price else price
-            confidence_bonus = min(max(0, (confidence - 0.60)) * 0.075, 0.03)
-            fill_buffer = base_buffer + confidence_bonus
-            # round() avant ceil() : (0.40 + 0.02) * 100 = 42.000000000000004 en flottant
-            offer_price = min(math.ceil(round((ask_anchor + 0.02) * 100, 6)) / 100,
-                              self._config.max_buy_price)
+            # Prix juste au-dessus du meilleur vendeur (ASK_BUFFER) pour être rempli
+            offer_price = compute_offer_price(
+                price, best_ask, self._config.ask_buffer, self._config.max_buy_price,
+            )
 
             size = compute_order_shares(amount_usdc, offer_price, balance, max_fraction)
             if size < POLY_MIN_SHARES:
@@ -641,9 +659,9 @@ class Sniper:
 
             committed = round(size * offer_price, 2)
             log.info(
-                "%s ORDER: %d shares @ $%.2f (market=$%.2f +$%.2f buf [base=$%.2f +conf=$%.2f]) = $%.2f",
-                order_type_str, size, offer_price, price, fill_buffer,
-                base_buffer, confidence_bonus, committed,
+                "%s ORDER: %d shares @ $%.2f (market=$%.2f, ask=$%.2f, +$%.2f buffer) = $%.2f",
+                order_type_str, size, offer_price, price, best_ask,
+                self._config.ask_buffer, committed,
             )
 
             order_args = OrderArgs(

@@ -19,6 +19,7 @@ import asyncio
 import os
 import signal
 import sys
+import time
 
 from balance_guard import BalanceGuard
 from config import CHAIN_ID, CLOB_HOST, SIGNATURE_TYPE, BotConfig
@@ -26,14 +27,35 @@ from learning_engine import LearningEngine
 from live_optimizer import LiveOptimizer
 from logger import log
 from market_manager import MarketManager
+from paths import DATA_DIR, HEARTBEAT_FILE
 from price_analyzer import PriceAnalyzer
 from profit_taker import ProfitTaker
 from sniper import Sniper
 from wallet_manager import WalletManager
 
 
+HEARTBEAT_INTERVAL = 30  # secondes ; le healthcheck Docker tolère 180 s
+
+
+async def heartbeat() -> None:
+    """Écrit l'heure courante dans HEARTBEAT_FILE tant que la boucle asyncio tourne.
+
+    Le healthcheck Docker vérifie que ce fichier a moins de 180 s : il détecte un
+    bot arrêté comme une boucle bloquée (le heartbeat ne s'écrit plus).
+    """
+    while True:
+        try:
+            with open(HEARTBEAT_FILE, "w") as f:
+                f.write(str(time.time()))
+        except Exception as e:
+            log.warning("Heartbeat: écriture impossible (%s): %s", HEARTBEAT_FILE, e)
+        await asyncio.sleep(HEARTBEAT_INTERVAL)
+
+
 async def main() -> None:
     config = BotConfig.from_env()
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    log.info("Fichiers d'état: %s", DATA_DIR.resolve())
 
     # Learning engine partagé entre sniper et harvester
     learning_engine = LearningEngine()
@@ -154,12 +176,16 @@ async def main() -> None:
              config.max_buy_price,
              ((1 - config.max_buy_price) / config.max_buy_price) * 100)
     log.info("  Entry window: last %ds", config.entry_window_seconds)
-    log.info("  Fill buffer: +$%.2f | Order type: %s", config.fill_buffer, config.order_type)
+    log.info("  Ask buffer: +$%.2f | Order type: %s", config.ask_buffer, config.order_type)
+    if "FILL_BUFFER" in os.environ:
+        log.warning("FILL_BUFFER est ignoré (il n'a jamais été appliqué) : "
+                    "utiliser ASK_BUFFER (défaut $0.02 au-dessus du meilleur vendeur)")
     log.info("  Signals: OBI + Momentum + Volume + RSI + VWAP + TradeRate")
     log.info("=" * 50)
 
     tasks_to_run.append(asyncio.create_task(sniper.run(), name="sniper"))
     tasks_to_run.append(asyncio.create_task(shutdown_event.wait(), name="shutdown"))
+    tasks_to_run.append(asyncio.create_task(heartbeat(), name="heartbeat"))
 
     # Process D: Balance Guard (live mode seulement)
     if not config.paper_trading and w3 is not None:

@@ -51,6 +51,24 @@ docker run -d --name polybot --restart unless-stopped --env-file .env \
 docker logs polybot -f
 ```
 
+Les fichiers d'état (`trade_history.json`, `learned_params.json`, `balance_guard_state.json`, `profit_history.json`, `heartbeat`) sont écrits dans `DATA_DIR`, soit `/app/data` dans l'image : le volume `/opt/polybot/data` les conserve d'une reconstruction à l'autre. Le conteneur tourne avec l'UID 1000, qui doit pouvoir écrire dans ce dossier :
+
+```bash
+sudo chown -R 1000:1000 /opt/polybot/data
+```
+
+Lors de la première mise à jour vers cette version, copier les anciens fichiers depuis le conteneur actuel avant de le supprimer :
+
+```bash
+for f in trade_history.json learned_params.json profit_history.json; do docker cp polybot:/app/$f /opt/polybot/data/ 2>/dev/null; done
+```
+
+Le healthcheck Docker est sain tant que le bot réécrit `/app/data/heartbeat` (toutes les 30 s, tolérance 180 s).
+
+### Prix des ordres
+
+Le bot offre `max(meilleur vendeur, prix du marché) + ASK_BUFFER` (défaut 0,02 $), plafonné à `MAX_BUY_PRICE`. L'ancienne variable `FILL_BUFFER` n'était pas appliquée ; elle est ignorée et signalée au démarrage.
+
 ## Supervision
 
 8 crons automatiques gèrent:

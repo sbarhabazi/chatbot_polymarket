@@ -113,6 +113,16 @@ def compute_order_shares(
     return 0
 
 
+def compute_offer_price(price: float, best_ask: float, ask_buffer: float,
+                        max_buy_price: float) -> float:
+    """Prix offert : max(best_ask, prix du marché) + ask_buffer, arrondi au cent
+    supérieur et plafonné à max_buy_price."""
+    anchor = best_ask if best_ask > price else price
+    # round() avant ceil() : (0.40 + 0.02) * 100 = 42.000000000000004 en flottant
+    cents = math.ceil(round((anchor + ask_buffer) * 100, 6))
+    return min(cents / 100, max_buy_price)
+
+
 class WalletManager:
     def __init__(self, config: BotConfig, clob_client=None, w3: Web3 | None = None):
         self._config = config

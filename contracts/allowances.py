@@ -2,6 +2,11 @@
 
 Run this once per wallet before the bot can trade:
     python -m contracts.allowances
+
+Les opérateurs Polymarket (échanges et adaptateur neg-risk) reçoivent une
+approbation illimitée : ils prélèvent l'USDC.e à chaque ordre rempli, et un
+plafond fixe bloquerait le trading une fois consommé. Le routeur Uniswap, lui,
+n'a plus d'approbation permanente (montant exact à chaque swap).
 """
 
 import time
@@ -68,11 +73,12 @@ def setup_allowances(config: BotConfig) -> None:
         if ok:
             count += 1
 
-    # 3. Approve USDC native for Uniswap router (1 tx)
+    # 3. Révoquer l'ancienne approbation illimitée USDC native -> Uniswap.
+    # contracts/swap.py approuve désormais le montant exact de chaque swap.
     router = Web3.to_checksum_address(UNISWAP_SWAP_ROUTER)
     ok = _send_tx(w3, wallet, config.private_key,
-                  usdc_native.functions.approve(router, MAX_UINT256),
-                  f"USDC native approve -> Uniswap")
+                  usdc_native.functions.approve(router, 0),
+                  "USDC native approve -> Uniswap révoquée (0)")
     if ok:
         count += 1
 

@@ -64,3 +64,27 @@ ERC1155_SET_APPROVAL_ABI = [
         "outputs": [],
     }
 ]
+
+
+# Résultat d'une condition résolue (Gnosis Conditional Tokens) : un token de
+# l'issue i paie payoutNumerators(i) / payoutDenominator USDC.e.
+# payoutDenominator vaut 0 tant que la condition n'est pas résolue on-chain.
+PAYOUT_ABI = [
+    {
+        "name": "payoutNumerators",
+        "type": "function",
+        "inputs": [
+            {"name": "", "type": "bytes32"},
+            {"name": "", "type": "uint256"},
+        ],
+        "outputs": [{"name": "", "type": "uint256"}],
+        "stateMutability": "view",
+    },
+    {
+        "name": "payoutDenominator",
+        "type": "function",
+        "inputs": [{"name": "", "type": "bytes32"}],
+        "outputs": [{"name": "", "type": "uint256"}],
+        "stateMutability": "view",
+    },
+]

@@ -22,9 +22,10 @@ from pathlib import Path
 from typing import Optional
 
 from logger import log
+from paths import data_path
 
-LEARNED_PARAMS_FILE = os.environ.get("LEARNED_PARAMS_FILE", "learned_params.json")
-TRADE_HISTORY_FILE = os.environ.get("TRADE_HISTORY_FILE", "trade_history.json")
+LEARNED_PARAMS_FILE = os.environ.get("LEARNED_PARAMS_FILE", data_path("learned_params.json"))
+TRADE_HISTORY_FILE = os.environ.get("TRADE_HISTORY_FILE", data_path("trade_history.json"))
 
 # Minimum de trades par bucket avant de faire confiance aux données
 MIN_TRADES_FOR_CALIBRATION = 15
@@ -193,10 +194,12 @@ class LearningEngine:
         if bucket not in table:
             return 0.0
 
-        row = table[bucket]
+        # Clés entières en mémoire (table par défaut, recalibrée) mais chaînes
+        # après un passage par JSON : on normalise avant de lire.
+        row = {int(k): v for k, v in table[bucket].items()}
         # Interpolation linéaire entre les colonnes
-        cols = sorted([int(k) for k in row.keys()], reverse=True)
-        vals = [row[str(c)] for c in cols]
+        cols = sorted(row.keys(), reverse=True)
+        vals = [row[c] for c in cols]
 
         t = seconds_remaining
         if t >= cols[0]:

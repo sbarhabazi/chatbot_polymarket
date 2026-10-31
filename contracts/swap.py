@@ -11,7 +11,6 @@ from contracts.abis import ERC20_APPROVE_ABI
 from contracts.addresses import UNISWAP_SWAP_ROUTER, USDC_E, USDC_NATIVE
 from logger import log
 
-MAX_UINT256 = 2**256 - 1
 
 # Uniswap V3 SwapRouter02 - exactInputSingle
 SWAP_ROUTER_ABI = [
@@ -107,7 +106,8 @@ def swap_native_usdc_to_usdc_e(
 
     nonce = w3.eth.get_transaction_count(wallet)
 
-    # Step 1: Approve USDC native for Uniswap router
+    # Step 1: Approve exactly the swapped amount for the Uniswap router
+    # (jamais d'approbation illimitée : le routeur ne peut prélever que ce swap)
     usdc_contract = w3.eth.contract(
         address=Web3.to_checksum_address(USDC_NATIVE),
         abi=ERC20_APPROVE_ABI,
@@ -115,7 +115,7 @@ def swap_native_usdc_to_usdc_e(
     router_addr = Web3.to_checksum_address(UNISWAP_SWAP_ROUTER)
 
     approve_tx = usdc_contract.functions.approve(
-        router_addr, MAX_UINT256
+        router_addr, amount_wei
     ).build_transaction({
         "chainId": 137,
         "from": wallet,
