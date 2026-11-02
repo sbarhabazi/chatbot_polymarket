@@ -82,7 +82,7 @@ class BotConfig:
             max_buy_price=float(os.environ.get("MAX_BUY_PRICE", "0.90")),
             abort_price=float(os.environ.get("ABORT_PRICE", "0.99")),
             min_market_liquidity=float(os.environ.get("MIN_MARKET_LIQUIDITY", "1000")),
-            min_btc_distance=float(os.environ.get("MIN_BTC_DISTANCE", "12.0")),
+            min_btc_distance=float(os.environ.get("MIN_BTC_DISTANCE", "25.0")),
             volatility_threshold=float(os.environ.get("VOLATILITY_THRESHOLD", "0.005")),
             momentum_confirmation_required=int(os.environ.get("MOMENTUM_CONFIRMATION_REQUIRED", "0")),
             high_confidence_threshold=float(os.environ.get("HIGH_CONFIDENCE_THRESHOLD", "0.72")),

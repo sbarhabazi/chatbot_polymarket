@@ -34,9 +34,11 @@ def test_paper_trade_mirrors_live_sizing_and_price():
     assert clob.orders == []  # aucun ordre réel
     rec = le._history[0]
     assert rec["source"] == "paper" and rec["side"] == "Down"
-    assert rec["share_price"] == pytest.approx(0.42)  # prix + ASK_BUFFER, comme en réel
+    # Taille calculée au prix limite (ask + ASK_BUFFER = 0,42 $), exécution au vrai ask (0,40 $)
+    assert rec["share_price"] == pytest.approx(0.40)
     shares = rec["amount_usdc"] / rec["share_price"]
     assert shares == pytest.approx(round(shares))  # nombre entier de parts
+    assert round(shares) == int(100.0 * 0.20 / 0.42)
     assert rec["amount_usdc"] <= 100.0 * 0.20 + 1e-9  # plafond du mode NORMAL
     assert asyncio.run(sniper._wm.get_usdc_balance()) == pytest.approx(100.0 - rec["amount_usdc"])
 

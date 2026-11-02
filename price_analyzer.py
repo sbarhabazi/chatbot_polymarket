@@ -37,11 +37,20 @@ from models import PriceSignal, PriceSnapshot
 
 warnings.filterwarnings("ignore", message="Polyfit may be poorly conditioned")
 
+# Transactions gardées par DURÉE, pas par nombre : avec un plafond de 1 200
+# transactions, un BTC agité (des centaines de transactions/s) ne laissait que
+# quelques secondes d'historique, et le RSI valait 50 (données insuffisantes)
+# dans 60 % des scans. 7 minutes couvrent les indicateurs (≤ 60 s) et le prix
+# d'ouverture de la fenêtre de 5 minutes en cours.
+PRICE_RETENTION_SECONDS = 420
+PRICE_BUFFER_HARD_CAP = 500_000  # garde-fou mémoire
+BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
+
 
 class PriceAnalyzer:
     def __init__(self, config: BotConfig):
         self._config = config
-        self._prices: deque[PriceSnapshot] = deque(maxlen=1200)
+        self._prices: deque[PriceSnapshot] = deque(maxlen=PRICE_BUFFER_HARD_CAP)
         self._running = False
         self._connected = False
         self._depth_connected = False
@@ -89,6 +98,47 @@ class PriceAnalyzer:
             return None
         return self._prices[-1].price
 
+    @property
+    def active_source(self) -> str:
+        return self._active_source
+
+    def _add_price(self, snapshot: PriceSnapshot) -> None:
+        self._prices.append(snapshot)
+        cutoff = snapshot.timestamp - PRICE_RETENTION_SECONDS
+        while self._prices and self._prices[0].timestamp < cutoff:
+            self._prices.popleft()
+
+    def price_at(self, ts: float, max_gap: float = 5.0) -> float | None:
+        """Prix de la dernière transaction à l'instant `ts` ou juste avant
+        (au plus `max_gap` s avant), si l'historique couvre ce moment."""
+        if not self._prices or self._prices[0].timestamp > ts:
+            return None
+        found = None
+        for p in self._prices:
+            if p.timestamp > ts:
+                break
+            found = p
+        if found is None or ts - found.timestamp > max_gap:
+            return None
+        return found.price
+
+    async def fetch_binance_price_at(self, ts: int) -> float | None:
+        """Prix Binance BTCUSDT à la seconde `ts` (ouverture de la bougie 1 s).
+        Sert quand le bot démarre en cours de fenêtre."""
+        try:
+            async with aiohttp.ClientSession() as session:
+                params = {"symbol": "BTCUSDT", "interval": "1s",
+                          "startTime": int(ts) * 1000, "limit": 1}
+                async with session.get(BINANCE_KLINES_URL, params=params,
+                                       timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                    if resp.status != 200:
+                        return None
+                    rows = await resp.json()
+            return float(rows[0][1]) if rows else None
+        except Exception as e:
+            log.warning("Binance kline request failed: %s", e)
+            return None
+
     # ─── Smart Source Selector ──────────────────────────────────
 
     async def _connect_best_trade_source(self) -> None:
@@ -131,7 +181,7 @@ class PriceAnalyzer:
                     if not self._running:
                         break
                     data = json.loads(message)
-                    self._prices.append(PriceSnapshot(
+                    self._add_price(PriceSnapshot(
                         price=float(data["p"]),
                         timestamp=float(data["T"]) / 1000.0,
                         volume=float(data["q"]),
@@ -171,7 +221,7 @@ class PriceAnalyzer:
                 # Kraken v2 trade messages
                 if data.get("channel") == "trade":
                     for trade in data.get("data", []):
-                        self._prices.append(PriceSnapshot(
+                        self._add_price(PriceSnapshot(
                             price=float(trade["price"]),
                             timestamp=time.time(),
                             volume=float(trade["qty"]),
@@ -200,7 +250,7 @@ class PriceAnalyzer:
                 data = json.loads(message)
 
                 if data.get("type") == "match" or data.get("type") == "last_match":
-                    self._prices.append(PriceSnapshot(
+                    self._add_price(PriceSnapshot(
                         price=float(data["price"]),
                         timestamp=time.time(),
                         volume=float(data["size"]),
@@ -228,7 +278,7 @@ class PriceAnalyzer:
                         if resp.status == 200:
                             data = await resp.json()
                             price = float(data["bitcoin"]["usd"])
-                            self._prices.append(PriceSnapshot(
+                            self._add_price(PriceSnapshot(
                                 price=price,
                                 timestamp=time.time(),
                                 volume=0.01,  # synthetic volume

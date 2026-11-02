@@ -9,9 +9,15 @@ Bot de trading automatique sur Polymarket — marchés BTC 5 minutes "Up or Down
 - **Process C (ProfitTaker):** Transfert automatique de $50 vers le portefeuille personnel quand la balance atteint $100
 - **LearningEngine:** Auto-calibration des seuils et du sizing après chaque trade résolu
 
+## Prix utilisés
+
+- **Prix d'achat** : meilleur vendeur du carnet d'ordres CLOB du token joué. Les prix de Gamma (`outcomePrices`, `bestAsk`) ne sont pas mis à jour pendant la fenêtre (mesuré le 2026-11-02 : Gamma figé à Up = 0,465 pendant que le prix réel passait de 0,42 à 0,30).
+- **Prix de référence** : prix Binance à l'ouverture exacte de la fenêtre (historique des transactions, ou API Binance si le bot démarre en cours de fenêtre). Le prix officiel Polymarket (Chainlink, en USD) n'est publié qu'après la clôture, et Binance (USDT) en diffère de 55 à 175 $ : le bot compare toujours Binance à Binance.
+- **Distance minimale** : `MIN_BTC_DISTANCE=25`. Sur 60 fenêtres, la variation Binance donnait le même gagnant que le résultat officiel 43 fois sur 44 au-delà de 25 $, mais seulement 47 fois sur 53 au-delà de 12 $.
+
 ## Mode papier et mesure de la stratégie
 
-Avec `PAPER_TRADING=true`, le bot simule chaque trade comme en réel : même prix offert (`ASK_BUFFER`), nombre entier de parts, minimum de 5 parts, plafond du mode calculé sur le solde simulé. L'ordre est supposé rempli au prix offert, ce qui est une hypothèse optimiste. Une minute après la fin de chaque fenêtre, le **PaperResolver** lit le résultat officiel du marché, enregistre gain ou perte dans `trade_history.json` et crédite le solde papier (frais de 7,2 % sur le gain déduits).
+Avec `PAPER_TRADING=true`, le bot simule chaque trade comme en réel : prix lu dans le carnet d'ordres CLOB du token joué, prix limite `ask + ASK_BUFFER`, nombre entier de parts, minimum de 5 parts, plafond du mode. Le trade n'est compté que si le carnet permet de l'exécuter entièrement à ce prix, au prix moyen réel des niveaux consommés. La mise est calculée sur au plus `PAPER_BALANCE` : les gains ne sont pas réinvestis, pour que chaque trade pèse autant dans la mesure. Une minute après la fin de chaque fenêtre, le **PaperResolver** lit le résultat officiel du marché, enregistre gain ou perte dans `trade_history.json` et crédite le solde papier (frais de 7,2 % sur le gain déduits).
 
 Rapport de performance :
 

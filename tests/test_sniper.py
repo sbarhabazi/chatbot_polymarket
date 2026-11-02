@@ -9,7 +9,7 @@ import pytest
 from config import BotConfig
 from learning_engine import LearningEngine
 from market_manager import compute_window_timestamp
-from models import MarketInfo
+from models import MarketInfo, OrderBook
 from sniper import Sniper
 
 
@@ -30,11 +30,20 @@ def make_market(up=0.60, down=0.40, best_ask=0.0) -> MarketInfo:
 
 
 class FakeMarketManager:
-    def __init__(self, market):
+    """Carnet CLOB simulé : par défaut, un vendeur profond au prix up/down du marché."""
+
+    def __init__(self, market, books=None):
         self.market = market
+        self.books = books or {}
 
     async def get_market_by_window_ts(self, _ts):
         return self.market
+
+    async def get_order_book(self, token_id):
+        if token_id in self.books:
+            return self.books[token_id]
+        price = self.market.up_price if token_id == self.market.up_token_id else self.market.down_price
+        return OrderBook(asks=[(price, 10_000.0)])
 
     def seconds_remaining(self, market):
         return (market.end_time - datetime.now(timezone.utc)).total_seconds()
@@ -42,6 +51,7 @@ class FakeMarketManager:
 
 class FakePriceAnalyzer:
     is_connected = True
+    active_source = "Binance"
 
     def __init__(self, side="Up", confidence=0.90):
         self.side = side
@@ -87,11 +97,12 @@ class FakeClob:
                 "orderID": "0xorder"}
 
 
-def make_sniper(market, *, balance=100.0, side="Up", confidence=0.90, clob=None):
+def make_sniper(market, *, balance=100.0, side="Up", confidence=0.90, clob=None, books=None):
     clob = clob or FakeClob()
     le = LearningEngine()
-    sniper = Sniper(make_config(), FakeMarketManager(market), FakePriceAnalyzer(side, confidence),
+    sniper = Sniper(make_config(), FakeMarketManager(market, books), FakePriceAnalyzer(side, confidence),
                     FakeWallet(balance), clob_client=clob, learning_engine=le)
+    sniper._window_open = (market.window_ts, market.price_to_beat, "Binance")
     return sniper, clob, le
 
 
@@ -128,8 +139,8 @@ def test_order_cost_respects_mode_cap():
     assert rec["share_price"] == order.price
 
 
-def test_down_order_does_not_use_up_best_ask():
-    # bestAsk de Gamma = celui du token Up ($0.62) : ne pas l'offrir pour Down ($0.40)
+def test_order_priced_from_clob_book_not_gamma():
+    # bestAsk/outcomePrices de Gamma ($0.62) ignorés : prix = meilleur vendeur Down ($0.40)
     market = make_market(up=0.60, down=0.40, best_ask=0.62)
     sniper, clob, _ = make_sniper(market, side="Down")
     assert run(sniper._attempt_entry(market)) is True
