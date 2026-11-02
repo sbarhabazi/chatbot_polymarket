@@ -178,11 +178,16 @@ async def main() -> None:
     log.info("POLYMARKET 5-MIN BTC SNIPER BOT v6 RUNNING")
     log.info("  Sizing: Kelly (fraction=%.0f%%, max=%.0f%%)",
              config.kelly_fraction * 100, config.max_kelly_size * 100)
-    log.info("  Max buy price: $%.2f (min yield ~%.0f%%)",
+    log.info("  Max buy price (CLOB ask): $%.2f (min yield ~%.0f%%)",
              config.max_buy_price,
              ((1 - config.max_buy_price) / config.max_buy_price) * 100)
     log.info("  Entry window: last %ds", config.entry_window_seconds)
     log.info("  Ask buffer: +$%.2f | Order type: %s", config.ask_buffer, config.order_type)
+    log.info("  Min BTC distance: $%.0f (Binance vs Binance à l'ouverture)", config.min_btc_distance)
+    if config.min_btc_distance < 25:
+        log.warning("MIN_BTC_DISTANCE=$%.0f < $25 : mesuré le 2026-11-02, la variation Binance "
+                    "ne donnait le bon gagnant que 47 fois sur 53 au-delà de 12 $ "
+                    "(43 sur 44 au-delà de 25 $)", config.min_btc_distance)
     if "FILL_BUFFER" in os.environ:
         log.warning("FILL_BUFFER est ignoré (il n'a jamais été appliqué) : "
                     "utiliser ASK_BUFFER (défaut $0.02 au-dessus du meilleur vendeur)")

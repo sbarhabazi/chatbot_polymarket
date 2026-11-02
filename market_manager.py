@@ -8,9 +8,9 @@ from datetime import datetime, timezone
 import aiohttp
 import certifi
 
-from config import GAMMA_API_BASE, MARKET_INTERVAL_SECONDS, BotConfig
+from config import CLOB_HOST, GAMMA_API_BASE, MARKET_INTERVAL_SECONDS, BotConfig
 from logger import log
-from models import MarketInfo
+from models import MarketInfo, OrderBook
 
 
 def compute_window_timestamp(unix_time: float | None = None) -> int:
@@ -123,6 +123,29 @@ class MarketManager:
             return self._parse_market(market, event, slug, window_ts)
 
         return None
+
+    async def get_order_book(self, token_id: str) -> OrderBook | None:
+        """Carnet d'ordres en temps réel d'un token (CLOB).
+
+        Les prix de Gamma (outcomePrices, bestAsk) ne sont pas à jour pendant la
+        fenêtre : mesuré le 2026-11-02, Gamma restait à Up=0,465 pendant que le
+        prix d'achat réel de Up passait de 0,42 à 0,30. Seul le CLOB fait foi.
+        """
+        session = await self._get_session()
+        try:
+            async with session.get(f"{CLOB_HOST}/book", params={"token_id": token_id},
+                                   timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                if resp.status != 200:
+                    log.warning("CLOB book %s... returned %d", token_id[:12], resp.status)
+                    return None
+                data = await resp.json()
+        except Exception as e:
+            log.warning("CLOB book request failed: %s", e)
+            return None
+        asks = sorted((float(a["price"]), float(a["size"])) for a in data.get("asks", []))
+        bids = sorted(((float(b["price"]), float(b["size"])) for b in data.get("bids", [])),
+                      reverse=True)
+        return OrderBook(asks=asks, bids=bids)
 
     async def get_recent_resolved_markets(self, count: int | None = None) -> list[MarketInfo]:
         count = count or self._config.max_recent_markets

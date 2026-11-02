@@ -75,3 +75,29 @@ class PriceSignal:
     buy_ratio_60s: float = 0.5   # Multi-TF buy ratio (60s window)
     signal_agreement: int = 0     # How many new signals agree with direction
     signal_total: int = 0         # Total new signals evaluated
+
+
+@dataclass
+class OrderBook:
+    """Carnet d'ordres CLOB d'un token : asks triés du moins cher au plus cher,
+    bids du plus cher au moins cher. Chaque niveau = (prix, nombre de parts)."""
+    asks: list[tuple[float, float]] = field(default_factory=list)
+    bids: list[tuple[float, float]] = field(default_factory=list)
+
+    @property
+    def best_ask(self) -> float | None:
+        return self.asks[0][0] if self.asks else None
+
+    def fill_cost(self, shares: float, limit_price: float) -> float | None:
+        """Coût d'achat de `shares` parts en remontant les asks jusqu'à
+        `limit_price` (comme un ordre FOK). None si le carnet ne suffit pas."""
+        remaining, cost = shares, 0.0
+        for price, size in self.asks:
+            if price > limit_price + 1e-9:
+                break
+            take = min(remaining, size)
+            cost += take * price
+            remaining -= take
+            if remaining <= 1e-9:
+                return cost
+        return None

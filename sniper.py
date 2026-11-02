@@ -6,8 +6,6 @@ from web3 import Web3
 
 from balance_guard import BalanceGuard
 from config import BotConfig
-from contracts.abis import CHAINLINK_AGGREGATOR_ABI
-from contracts.addresses import CHAINLINK_BTC_USD
 from learning_engine import LearningEngine, TradeRecord
 from logger import log
 from market_manager import MarketManager, compute_window_timestamp
@@ -45,8 +43,8 @@ class Sniper:
         self._last_traded_window: int | None = None
         self._last_observed_window: int | None = None
         self._paper_trades: list[dict] = []
-        self._chainlink_open_price: float | None = None
-        self._price_source: str = "none"  # "api", "binance", "kraken", "chainlink"
+        # (window_ts, prix d'ouverture, source) de la fenêtre en cours
+        self._window_open: tuple[int, float, str] | None = None
         self._order_attempted_this_window: bool = False  # 1 ordre max par fenêtre
 
         # Defensive: prevent any possibility of double-trade in the same window
@@ -54,14 +52,6 @@ class Sniper:
         self._order_pending_window: int | None = None
         self._active_gtc_order_id: str | None = None  # Pour annulation si non rempli
         self._active_gtc_context: tuple[str, float] | None = None  # (côté, priceToBeat)
-
-        # Chainlink oracle (same source Polymarket uses for resolution)
-        self._chainlink = None
-        if w3:
-            self._chainlink = w3.eth.contract(
-                address=Web3.to_checksum_address(CHAINLINK_BTC_USD),
-                abi=CHAINLINK_AGGREGATOR_ABI,
-            )
 
     async def run(self) -> None:
         mode = "PAPER" if self._config.paper_trading else "LIVE"
@@ -93,74 +83,22 @@ class Sniper:
             await asyncio.sleep(1)
             return
 
-        # Capture reference BTC price on first observation of new window
-        if self._last_observed_window != current_window:
-            # Priority 1: Previous window's finalPrice (= current window's real priceToBeat)
-            prev_final = await self._mm.get_previous_final_price(current_window)
-            if prev_final:
-                self._chainlink_open_price = prev_final
-                self._price_source = "api"
-                log.info("Window %d priceToBeat=$%.2f (VERIFIED from API, %.0fs left)",
-                         current_window, prev_final, remaining)
-            else:
-                # Priority 2: Real-time price from active source (Binance/Kraken/Coinbase)
-                live_price = self._pa.get_current_price()
-                if live_price:
-                    self._chainlink_open_price = live_price
-                    self._price_source = self._pa._active_source.lower().split()[0]  # "binance", "kraken", "coinbase"
-                    log.warning("Window %d %s BTC: $%.2f (APPROX — prev not resolved yet, %.0fs left)",
-                                current_window, self._pa._active_source, live_price, remaining)
-                else:
-                    # Priority 3: Chainlink (least accurate)
-                    self._chainlink_open_price = await self._get_chainlink_price()
-                    self._price_source = "chainlink"
-                    if self._chainlink_open_price:
-                        log.warning("Window %d Chainlink: $%.2f (LEAST RELIABLE, %.0fs left)",
-                                    current_window, self._chainlink_open_price, remaining)
-
-            # Paper mode fallback
-            if self._chainlink_open_price is None and self._config.paper_trading:
-                self._chainlink_open_price = self._pa.get_current_price()
-                self._price_source = "binance"
-
-            self._last_observed_window = current_window
+        # Prix de référence : prix de la source temps réel à l'ouverture EXACTE de
+        # la fenêtre. Le prix officiel Polymarket (Chainlink, en USD) n'est publié
+        # qu'après la clôture, et Binance (USDT) en diffère d'environ 55 à 175 $ :
+        # on compare donc toujours Binance à Binance.
+        if self._window_open is None or self._window_open[0] != current_window:
+            await self._capture_window_open(current_window, remaining)
 
         # Observation phase
         if not self._mm.is_in_entry_window(market):
             btc = self._pa.get_current_price()
             btc_str = f"${btc:,.2f}" if btc else "N/A"
-
-            # Try to upgrade priceToBeat from API or previous window (every ~30s)
-            ptb = market.price_to_beat
-            if ptb is None and int(remaining) % 30 < 6:
-                refreshed = await self._mm.get_market_by_window_ts(market.window_ts)
-                if refreshed and refreshed.price_to_beat:
-                    ptb = refreshed.price_to_beat
-
-            # Keep trying to upgrade to VERIFIED price if we only have an approximation
-            if ptb is None and self._price_source != "api" and int(remaining) % 15 < 6:
-                prev_final = await self._mm.get_previous_final_price(current_window)
-                if prev_final:
-                    old = self._chainlink_open_price
-                    self._chainlink_open_price = prev_final
-                    self._price_source = "api"
-                    diff = prev_final - old if old else 0
-                    log.info("UPGRADED priceToBeat=$%.2f (VERIFIED, was $%.2f, diff=$%.1f)",
-                             prev_final, old or 0, diff)
-
-            # Display beat from best available source
-            beat = ptb or (self._chainlink_open_price if self._chainlink_open_price else None)
-            ptb_str = f"beat=${beat:,.2f}" if beat else "beat=N/A"
-            dist = ""
-            if btc and beat:
-                d = btc - float(beat)
-                dist = f"dist=${d:+.1f}"
-
-            log.info(
-                "Observing %d | %.0fs left | BTC: %s | %s %s | Up=$%.3f Down=$%.3f",
-                current_window, remaining, btc_str, ptb_str, dist,
-                market.up_price, market.down_price,
-            )
+            beat = self._window_open[1] if self._window_open else None
+            ptb_str = f"open=${beat:,.2f}" if beat else "open=N/A"
+            dist = f"dist=${btc - beat:+.1f}" if btc and beat else ""
+            log.info("Observing %d | %.0fs left | BTC: %s | %s %s",
+                     current_window, remaining, btc_str, ptb_str, dist)
             await asyncio.sleep(5)
             return
 
@@ -173,7 +111,6 @@ class Sniper:
         # but we also set it here to prevent re-entry even if no trade was placed)
         self._last_traded_window = current_window
         self._order_pending_window = None
-        self._window_open_price = None  # Reset for next window
 
         remaining = max(0, self._mm.seconds_remaining(market))
         if traded:
@@ -183,6 +120,30 @@ class Sniper:
         else:
             log.info("No trade this window, %.0fs until close", remaining)
         await asyncio.sleep(max(0, self._mm.seconds_remaining(market)) + 2)
+
+    async def _capture_window_open(self, window_ts: int, remaining: float) -> None:
+        """Mémorise le prix de la source temps réel à l'ouverture de la fenêtre.
+
+        Pris dans l'historique des transactions (7 min) ; si le bot a démarré
+        après l'ouverture, demandé à l'API Binance (bougie 1 s). Sinon, aucune
+        référence fiable : la fenêtre est sautée.
+        """
+        source = self._pa.active_source
+        price = self._pa.price_at(window_ts)
+        origin = "historique"
+        if price is None and source == "Binance":
+            price = await self._pa.fetch_binance_price_at(window_ts)
+            origin = "API Binance"
+        if price is None:
+            if self._last_observed_window != window_ts:
+                log.warning("Window %d: pas de prix d'ouverture %s fiable — fenêtre sautée",
+                            window_ts, source)
+            self._last_observed_window = window_ts
+            return
+        self._window_open = (window_ts, price, source)
+        self._last_observed_window = window_ts
+        log.info("Window %d open=$%.2f (%s, %s, %.0fs left)",
+                 window_ts, price, source, origin, remaining)
 
     async def _scan_entry_window(self, market: MarketInfo) -> bool:
         """Continuously scan for entry opportunity during the entry window.
@@ -229,64 +190,18 @@ class Sniper:
         # Log every 3rd scan to avoid spam (or always for first scan)
         verbose = (scan_count == 0) or (scan_count % 3 == 0)
 
-        # Check 1: price_to_beat available?
-        # Priority: Polymarket API > Chainlink oracle
-        ptb = market.price_to_beat
-        if ptb is None:
-            refreshed = await self._mm.get_market_by_window_ts(market.window_ts)
-            if refreshed and refreshed.price_to_beat:
-                ptb = refreshed.price_to_beat
-
-        if ptb is None and self._chainlink_open_price:
-            if self._price_source == "api":
-                ptb = self._chainlink_open_price
-                if verbose:
-                    log.info("Using VERIFIED priceToBeat: $%.2f", ptb)
-            else:
-                # Try to upgrade to verified price first
-                prev_final = await self._mm.get_previous_final_price(market.window_ts)
-                if prev_final:
-                    self._chainlink_open_price = prev_final
-                    self._price_source = "api"
-                    ptb = prev_final
-                    log.info("UPGRADED to verified priceToBeat=$%.2f", ptb)
-                else:
-                    # Use approximate price if distance exceeds safety margin for the source.
-                    # Binance/Kraken at window open ≈ real priceToBeat within $5-20
-                    # Chainlink on-chain can lag by $50-80 vs Polymarket's resolution price
-                    btc_now = self._pa.get_current_price()
-                    if btc_now:
-                        approx_dist = abs(btc_now - self._chainlink_open_price)
-                        safety = 25 if self._price_source in ("binance", "kraken") else 80
-                        if approx_dist > safety:
-                            ptb = self._chainlink_open_price
-                            if verbose:
-                                log.info("Using APPROX %s=$%.2f (dist=$%.0f > $%d safety)",
-                                         self._price_source, ptb, approx_dist, safety)
-                        else:
-                            if verbose:
-                                log.info("WAIT: price not verified (%s), dist=$%.0f < $%d safety",
-                                         self._price_source, approx_dist, safety)
-                            return False
-                    else:
-                        return False
-
-        # Paper trading: if still no priceToBeat, use current BTC price as approximation
-        if ptb is None and self._config.paper_trading:
-            btc_now = self._pa.get_current_price()
-            if btc_now:
-                ptb = btc_now
-                self._chainlink_open_price = btc_now
-                self._price_source = "approx"
-                if verbose:
-                    log.info("PAPER: using current BTC=$%.2f as priceToBeat (approx)", ptb)
-
-        if ptb is None:
+        # Check 1: prix d'ouverture de la fenêtre, même source que le prix actuel
+        window_open = self._window_open
+        if not window_open or window_open[0] != market.window_ts:
             if verbose:
-                log.info("SKIP: no priceToBeat available")
+                log.info("SKIP: no window open price")
             return False
-
-        price_to_beat = float(ptb)
+        if window_open[2] != self._pa.active_source:
+            if verbose:
+                log.warning("SKIP: price source changed (%s → %s) — distance non comparable",
+                            window_open[2], self._pa.active_source)
+            return False
+        price_to_beat = window_open[1]
 
         # Check 2: PriceAnalyzer connected?
         if not self._pa.is_connected:
@@ -347,12 +262,15 @@ class Sniper:
         # cher pour le capital, on saute la fenêtre (plus de bascule vers le côté opposé).
         side = signal.recommended_side
         token_id = market.up_token_id if side == "Up" else market.down_token_id
-        share_price = market.up_price if side == "Up" else market.down_price
 
-        # Refresh prices
-        refreshed = await self._mm.get_market_by_window_ts(market.window_ts)
-        if refreshed and refreshed.accepting_orders:
-            share_price = refreshed.up_price if side == "Up" else refreshed.down_price
+        # Prix d'achat réel : meilleur vendeur du carnet CLOB de CE token
+        # (les prix Gamma ne sont pas à jour pendant la fenêtre).
+        book = await self._mm.get_order_book(token_id)
+        if book is None or book.best_ask is None:
+            if verbose:
+                log.info("SKIP: no ask in %s order book", side)
+            return False
+        share_price = book.best_ask
 
         net_yield = calculate_net_yield(share_price)
 
@@ -424,7 +342,11 @@ class Sniper:
         else:
             tier = "LOW"
 
-        bet_amount = round(balance * size_fraction, 2)
+        # En papier, la mise est calculée sur au plus PAPER_BALANCE : les gains ne
+        # sont pas réinvestis, pour que chaque trade pèse autant dans la mesure.
+        sizing_balance = (min(balance, self._config.paper_balance)
+                          if self._config.paper_trading else balance)
+        bet_amount = round(sizing_balance * size_fraction, 2)
 
         # Plancher absolu: $0.50
         if bet_amount < abs_min_bet:
@@ -464,29 +386,29 @@ class Sniper:
                 signal.signal_agreement, signal.signal_total,
             )
 
-            # Gamma `bestAsk` est celui du premier token (Up) : ne pas l'appliquer à Down.
-            if side == "Up" and refreshed and refreshed.best_ask > 0:
-                best_ask = refreshed.best_ask
-            else:
-                best_ask = share_price
-
             if self._config.paper_trading:
                 # Simulation fidèle au réel : même prix offert, même nombre entier de
-                # parts (minimum 5, plafond du mode). Hypothèse optimiste : l'ordre
-                # est supposé rempli au prix offert.
+                # parts (minimum 5, plafond du mode), et l'ordre n'est compté que si
+                # le carnet CLOB permet de l'exécuter entièrement à ce prix (FOK).
                 offer_price = compute_offer_price(
-                    share_price, best_ask, self._config.ask_buffer, self._config.max_buy_price,
+                    share_price, share_price, self._config.ask_buffer, self._config.max_buy_price,
                 )
-                shares = compute_order_shares(bet_amount, offer_price, balance, kelly_cap)
+                shares = compute_order_shares(bet_amount, offer_price, sizing_balance, kelly_cap)
                 if shares < POLY_MIN_SHARES:
                     self._order_pending_window = None
                     log.info("PAPER SKIP: 5 parts @ $%.2f dépassent le plafond du mode", offer_price)
                     return False
-                cost = round(shares * offer_price, 2)
+                fill = book.fill_cost(shares, offer_price)
+                if fill is None:
+                    self._order_pending_window = None
+                    log.info("PAPER SKIP: carnet insuffisant pour %d parts ≤ $%.2f", shares, offer_price)
+                    return False
+                cost = round(fill, 2)
+                avg_price = cost / shares
                 self._paper_trades.append({
                     "window": market.window_ts,
                     "side": side,
-                    "price": offer_price,
+                    "price": avg_price,
                     "amount": cost,
                     "shares": shares,
                     "potential_payout": float(shares),
@@ -497,17 +419,17 @@ class Sniper:
                 })
                 self._wm.paper_deduct(cost)
                 self._last_traded_window = compute_window_timestamp()
-                self._record_trade(market, side, signal, remaining, offer_price, cost)
+                self._record_trade(market, side, signal, remaining, avg_price, cost)
                 log.info(
-                    "PAPER BUY OK: %s %d parts @ $%.2f = $%.2f | trades=%d | bal=$%.2f",
-                    side, shares, offer_price, cost, len(self._paper_trades),
+                    "PAPER BUY OK: %s %d parts @ $%.3f (ask $%.2f) = $%.2f | trades=%d | bal=$%.2f",
+                    side, shares, avg_price, share_price, cost, len(self._paper_trades),
                     await self._wm.get_usdc_balance(),
                 )
                 return True
 
             placed = await self._place_limit_buy(
                 token_id, bet_amount, share_price, signal.confidence,
-                best_ask=best_ask, balance=balance, max_fraction=kelly_cap,
+                best_ask=share_price, balance=balance, max_fraction=kelly_cap,
             )
             if placed is None:
                 self._order_pending_window = None
@@ -747,16 +669,4 @@ class Sniper:
                 log.warning("Insufficient balance for order (USDC locked in active orders)")
             else:
                 log.error("Order execution error: %s", e, exc_info=True)
-            return None
-
-    async def _get_chainlink_price(self) -> float | None:
-        """Get BTC/USD price from Chainlink oracle (same source as Polymarket resolution)."""
-        if not self._chainlink:
-            return None
-        try:
-            data = await asyncio.to_thread(self._chainlink.functions.latestRoundData().call)
-            price = data[1] / 1e8  # Chainlink uses 8 decimals
-            return price
-        except Exception as e:
-            log.warning("Chainlink oracle error: %s", e)
             return None
