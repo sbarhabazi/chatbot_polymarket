@@ -2,7 +2,6 @@ import asyncio
 import dataclasses
 import time
 from datetime import datetime, timedelta, timezone
-from types import SimpleNamespace
 
 import pytest
 
@@ -15,7 +14,9 @@ from sniper import Sniper
 
 def make_config(**overrides) -> BotConfig:
     cfg = BotConfig.from_env()
-    return dataclasses.replace(cfg, paper_trading=False, **overrides)
+    base = dict(paper_trading=False, reference_feed="binance", basis_noise=0.0)
+    base.update(overrides)
+    return dataclasses.replace(cfg, **base)
 
 
 def make_market(up=0.60, down=0.40, best_ask=0.0) -> MarketInfo:
@@ -50,20 +51,29 @@ class FakeMarketManager:
 
 
 class FakePriceAnalyzer:
+    """Prix Binance simulé : place le prix actuel pour que le modèle donne
+    P(side) = confidence (volatilité 1 $/√s, sans bruit de base)."""
     is_connected = True
     active_source = "Binance"
 
-    def __init__(self, side="Up", confidence=0.90):
-        self.side = side
-        self.confidence = confidence
+    def __init__(self, side="Up", confidence=0.90, price_to_beat=100_000.0, seconds_left=90.0):
+        from statistics import NormalDist
+        z = NormalDist().inv_cdf(confidence)
+        sd = (seconds_left ** 0.5)
+        self.price_to_beat = price_to_beat
+        self.current = price_to_beat + (z * sd if side == "Up" else -z * sd)
 
-    def compute_distance_signal(self, price_to_beat, seconds_remaining):
-        return SimpleNamespace(
-            recommended_side=self.side, confidence=self.confidence,
-            distance_confidence=self.confidence, skip_reason=None,
-            signal_agreement=3, signal_total=4, btc_distance=60.0,
-            obi=0.0, rsi=50.0, current_price=price_to_beat + 60.0,
-        )
+    def get_current_price(self):
+        return self.current
+
+    def price_at(self, ts):
+        return self.price_to_beat
+
+    def volatility_per_sqrt_s(self, lookback=300.0):
+        return 1.0
+
+    async def fetch_binance_price_at(self, ts):
+        return self.price_to_beat
 
 
 class FakeWallet:
@@ -135,8 +145,10 @@ def test_order_cost_respects_mode_cap():
     order = clob.orders[0]
     assert order.size * order.price <= 100.0 * 0.20 + 1e-9  # cap du mode NORMAL
     rec = le._history[0]
-    assert rec["amount_usdc"] == pytest.approx(order.size * order.price, abs=0.01)
-    assert rec["share_price"] == order.price
+    fee = 0.07 * order.price * (1 - order.price)
+    assert rec["amount_usdc"] == pytest.approx(order.size * (order.price + fee), abs=0.01)
+    assert rec["amount_usdc"] <= 100.0 * 0.20 + 0.01  # frais compris, sous le plafond
+    assert rec["share_price"] == order.price and rec["shares"] == order.size
 
 
 def test_order_priced_from_clob_book_not_gamma():

@@ -9,15 +9,42 @@ Bot de trading automatique sur Polymarket — marchés BTC 5 minutes "Up or Down
 - **Process C (ProfitTaker):** Transfert automatique de $50 vers le portefeuille personnel quand la balance atteint $100
 - **LearningEngine:** Auto-calibration des seuils et du sizing après chaque trade résolu
 
-## Prix utilisés
+## Stratégie (v7)
 
-- **Prix d'achat** : meilleur vendeur du carnet d'ordres CLOB du token joué. Les prix de Gamma (`outcomePrices`, `bestAsk`) ne sont pas mis à jour pendant la fenêtre (mesuré le 2026-11-02 : Gamma figé à Up = 0,465 pendant que le prix réel passait de 0,42 à 0,30).
-- **Prix de référence** : prix Binance à l'ouverture exacte de la fenêtre (historique des transactions, ou API Binance si le bot démarre en cours de fenêtre). Le prix officiel Polymarket (Chainlink, en USD) n'est publié qu'après la clôture, et Binance (USDT) en diffère de 55 à 175 $ : le bot compare toujours Binance à Binance.
-- **Distance minimale** : `MIN_BTC_DISTANCE=25`. Sur 60 fenêtres, la variation Binance donnait le même gagnant que le résultat officiel 43 fois sur 44 au-delà de 25 $, mais seulement 47 fois sur 53 au-delà de 12 $.
+À chaque scan de la fenêtre d'entrée (2 dernières minutes), le bot :
+
+1. **Suit le prix qui tranche le marché.** Polymarket règle les marchés Up/Down avec un TWAP Chainlink (docs : « The TWAP at the start sets the price to beat. When the duration ends, the TWAP at that time sets the final price »). Le bot le reçoit en temps réel via PolyBolt (`wss://ws-live-v2.polymarket.com/ws`, canaux `price.crypto` et `price.crypto.twap`), avec les identifiants API CLOB dérivés de `PRIVATE_KEY`. Binance (USDT) diffère du prix officiel de 55 à 175 $, et de 21 $ en médiane sur la variation d'une fenêtre.
+2. **Calcule une probabilité** : P(final ≥ priceToBeat), avec l'écart actuel, le temps restant et la volatilité mesurée sur 5 minutes (marche aléatoire ; pour le TWAP, la partie déjà observée de la dernière minute est prise en compte). Probabilité bornée à [3 %, 97 %].
+3. **Compare au prix réel du carnet CLOB, frais compris** : frais taker `0,07 × p × (1 − p)` par part (docs Polymarket). Il achète le côté dont l'espérance `P − prix − frais` est la plus haute, seulement si elle dépasse `MIN_EDGE` (0,05 $ par part par défaut), évaluée au prix limite `ask + ASK_BUFFER`.
+4. **Dimensionne avec Kelly** sur cette probabilité, plafonné par le mode du BalanceGuard, frais compris.
+
+| Variable | Défaut | Rôle |
+|---|---|---|
+| `REFERENCE_FEED` | `chainlink_twap` | `chainlink_twap`, `chainlink` (spot) ou `binance` |
+| `MIN_EDGE` | `0.05` | Espérance minimale par part, frais compris |
+| `BASIS_NOISE_USD` | `25` | Erreur Binance/Chainlink ajoutée au modèle (mode `binance`) |
+| `MAX_BUY_PRICE` | `0.90` | Prix maximal d'une part |
+
+Sources de prix Binance : en cas de coupure, le bot réessaie Binance 5 fois, puis passe 5 minutes au plus sur Kraken ou Coinbase avant de revenir à Binance. Un flux muet pendant 30 s est considéré comme mort. CoinGecko n'est plus utilisé.
+
+## Calibration : le journal fantôme
+
+À chaque fenêtre, le bot note sans trader son estimation du priceToBeat selon chaque source (`open`), puis à 120, 90, 60, 30 et 15 s de la fin la probabilité du modèle et les prix du carnet (`quote`), dans `shadow_log.jsonl`. L'**OutcomeRecorder** ajoute 7 minutes après la clôture le priceToBeat, le finalPrice et le gagnant officiels (`window_outcomes.jsonl`). Rapport :
+
+```bash
+docker exec polybot python scripts/shadow_report.py
+```
+
+Il répond à trois questions sur toutes les fenêtres, environ 288 par jour :
+1. Quelle source reproduit le priceToBeat officiel (écart médian proche de 0 $) ?
+2. Le modèle est-il calibré, et prédit-il mieux que le prix du marché (score de Brier) ?
+3. Quel `MIN_EDGE` aurait gagné de l'argent, frais compris ?
+
+Ne passer en réel que si la réponse à la question 3 est positive sur au moins quelques centaines de fenêtres.
 
 ## Mode papier et mesure de la stratégie
 
-Avec `PAPER_TRADING=true`, le bot simule chaque trade comme en réel : prix lu dans le carnet d'ordres CLOB du token joué, prix limite `ask + ASK_BUFFER`, nombre entier de parts, minimum de 5 parts, plafond du mode. Le trade n'est compté que si le carnet permet de l'exécuter entièrement à ce prix, au prix moyen réel des niveaux consommés. La mise est calculée sur au plus `PAPER_BALANCE` : les gains ne sont pas réinvestis, pour que chaque trade pèse autant dans la mesure. Une minute après la fin de chaque fenêtre, le **PaperResolver** lit le résultat officiel du marché, enregistre gain ou perte dans `trade_history.json` et crédite le solde papier (frais de 7,2 % sur le gain déduits).
+Avec `PAPER_TRADING=true`, le bot simule chaque trade comme en réel : prix lu dans le carnet d'ordres CLOB du token joué, prix limite `ask + ASK_BUFFER`, nombre entier de parts, minimum de 5 parts, plafond du mode, frais taker payés à l'achat. Le trade n'est compté que si le carnet permet de l'exécuter entièrement à ce prix, au prix moyen réel des niveaux consommés. La mise est calculée sur au plus `PAPER_BALANCE` : les gains ne sont pas réinvestis, pour que chaque trade pèse autant dans la mesure. Une minute après la fin de chaque fenêtre, le **PaperResolver** lit le résultat officiel du marché, enregistre gain ou perte dans `trade_history.json` et crédite le solde papier de 1 $ par part gagnante.
 
 Rapport de performance :
 

@@ -15,7 +15,8 @@ from test_sniper import make_market, make_sniper
 
 
 def paper_config(balance=100.0) -> BotConfig:
-    return dataclasses.replace(BotConfig.from_env(), paper_trading=True, paper_balance=balance)
+    return dataclasses.replace(BotConfig.from_env(), paper_trading=True, paper_balance=balance,
+                               reference_feed="binance", basis_noise=0.0)
 
 
 # ─── Sniper en papier ─────────────────────────────────────────────────────────
@@ -34,11 +35,12 @@ def test_paper_trade_mirrors_live_sizing_and_price():
     assert clob.orders == []  # aucun ordre réel
     rec = le._history[0]
     assert rec["source"] == "paper" and rec["side"] == "Down"
-    # Taille calculée au prix limite (ask + ASK_BUFFER = 0,42 $), exécution au vrai ask (0,40 $)
+    # Taille au coût limite (0,42 $ + frais), exécution au vrai ask (0,40 $), frais compris
     assert rec["share_price"] == pytest.approx(0.40)
-    shares = rec["amount_usdc"] / rec["share_price"]
-    assert shares == pytest.approx(round(shares))  # nombre entier de parts
-    assert round(shares) == int(100.0 * 0.20 / 0.42)
+    shares = rec["shares"]
+    assert shares == int(shares)  # nombre entier de parts
+    assert shares == int(100.0 * 0.20 / (0.42 + 0.07 * 0.42 * 0.58))
+    assert rec["amount_usdc"] == pytest.approx(round(shares * (0.40 + 0.07 * 0.40 * 0.60), 2))
     assert rec["amount_usdc"] <= 100.0 * 0.20 + 1e-9  # plafond du mode NORMAL
     assert asyncio.run(sniper._wm.get_usdc_balance()) == pytest.approx(100.0 - rec["amount_usdc"])
 
@@ -99,8 +101,8 @@ def test_resolver_records_win_and_credits_balance():
     assert asyncio.run(PaperResolver(mm, le, wm).resolve_pending(now=AFTER)) == 1
     rec = le._history[0]
     assert rec["won"] is True
-    assert rec["payout"] == pytest.approx(paper_payout(10, 6.0))  # 10 − 7,2 % × 4 = 9,712
-    assert asyncio.run(wm.get_usdc_balance()) == pytest.approx(94.0 + 9.712)
+    assert rec["payout"] == pytest.approx(paper_payout(10)) == 10.0  # frais payés à l'achat
+    assert asyncio.run(wm.get_usdc_balance()) == pytest.approx(94.0 + 10.0)
 
 
 def test_resolver_records_loss():
@@ -151,7 +153,7 @@ def test_resolved_winner(up, down, closed, resolved, expected):
 # ─── Rapport ──────────────────────────────────────────────────────────────────
 
 def test_breakeven_includes_fees():
-    assert breakeven(0.50) == pytest.approx(0.5 / (0.5 + 0.5 * 0.928))
+    assert breakeven(0.50) == pytest.approx(0.50 + 0.07 * 0.25)
     assert breakeven(0.70) > 0.70
 
 

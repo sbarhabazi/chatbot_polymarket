@@ -1,12 +1,11 @@
 """Prix réels : carnet CLOB, prix d'ouverture Binance de la fenêtre, historique par durée."""
 import asyncio
-import dataclasses
 
 import pytest
 
 from models import OrderBook, PriceSnapshot
 from price_analyzer import PRICE_RETENTION_SECONDS, PriceAnalyzer
-from test_paper_mode import make_paper_sniper, paper_config
+from test_paper_mode import make_paper_sniper
 from test_sniper import make_config, make_market, make_sniper
 
 
@@ -40,8 +39,11 @@ def test_paper_fill_price_is_book_average():
     sniper._mm.books = {"DOWN": OrderBook(asks=[(0.40, 20.0), (0.41, 1000.0)])}
     assert asyncio.run(sniper._attempt_entry(market)) is True
     rec = le._history[0]
-    shares = round(rec["amount_usdc"] / rec["share_price"])
-    assert rec["amount_usdc"] == pytest.approx(round(20 * 0.40 + (shares - 20) * 0.41, 2))
+    shares = rec["shares"]
+    fill = 20 * 0.40 + (shares - 20) * 0.41
+    avg = fill / shares
+    assert rec["share_price"] == pytest.approx(avg)
+    assert rec["amount_usdc"] == pytest.approx(round(fill + shares * 0.07 * avg * (1 - avg), 2))
 
 
 def test_live_order_priced_from_book_ask():

@@ -78,9 +78,11 @@ class PaperResolver:
                 continue  # pas encore résolu : réessayer au prochain passage
 
             cost = float(trade["amount_usdc"])
-            shares = round(cost / trade["share_price"]) if trade["share_price"] > 0 else 0
+            shares = trade.get("shares")
+            if shares is None:  # ancien format : coût sans frais, nombre entier de parts
+                shares = round(cost / trade["share_price"]) if trade["share_price"] > 0 else 0
             won = trade["side"] == winner
-            payout = paper_payout(shares, cost) if won else 0.0
+            payout = paper_payout(shares) if won else 0.0
             if payout:
                 self._wm.paper_add(payout)
             self._le.record_result(window_ts, won=won, payout=payout)

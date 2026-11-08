@@ -124,6 +124,36 @@ class MarketManager:
 
         return None
 
+    async def get_window_result(self, window_ts: int) -> dict | None:
+        """Résultat officiel d'une fenêtre terminée : priceToBeat, finalPrice
+        (eventMetadata, publiés à la clôture puis 1 à 6 min après) et gagnant.
+        None tant que ce n'est pas publié."""
+        session = await self._get_session()
+        url = f"{GAMMA_API_BASE}/events?slug={build_slug(window_ts)}"
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+        except Exception as e:
+            log.debug("Window result request failed: %s", e)
+            return None
+        if not data:
+            return None
+        event = data[0]
+        meta = event.get("eventMetadata") or {}
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except (json.JSONDecodeError, TypeError):
+                meta = {}
+        ptb, final = meta.get("priceToBeat"), meta.get("finalPrice")
+        if ptb is None or final is None:
+            return None
+        winner = "Up" if float(final) >= float(ptb) else "Down"
+        return {"window_ts": window_ts, "price_to_beat": float(ptb),
+                "final_price": float(final), "winner": winner}
+
     async def get_order_book(self, token_id: str) -> OrderBook | None:
         """Carnet d'ordres en temps réel d'un token (CLOB).
 
