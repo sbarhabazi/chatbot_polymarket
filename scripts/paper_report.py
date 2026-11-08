@@ -22,15 +22,15 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from learning_engine import TRADE_HISTORY_FILE  # noqa: E402
+from probability import cost_per_share  # noqa: E402
 
-FEE_RATE = 0.072
 BUCKETS = [(0.0, 0.65), (0.65, 0.70), (0.70, 0.75), (0.75, 0.80), (0.80, 0.90), (0.90, 1.01)]
 
 
 def breakeven(price: float) -> float:
-    """Taux de gain minimal pour qu'un achat au prix `price` soit rentable."""
-    # gain net si victoire : (1 - p)(1 - fee) ; perte sinon : p
-    return price / (price + (1 - price) * (1 - FEE_RATE))
+    """Taux de gain minimal pour qu'un achat au prix `price` soit rentable :
+    le coût par part, frais taker compris (une part gagnante paie 1 $)."""
+    return cost_per_share(price)
 
 
 def summarize(trades: list[dict]) -> dict:
@@ -81,7 +81,7 @@ def build_report(history: list[dict], source: str = "paper") -> str:
         f"Misé       : ${s['cost']:.2f} | reçu ${s['payout']:.2f} | "
         f"P&L ${s['pnl']:+.2f} ({s['roi']:+.1%})",
         "",
-        "Par confiance : n | gagnés | seuil | P&L",
+        "Par probabilité annoncée : n | gagnés | seuil | P&L",
     ]
     for lo, hi in BUCKETS:
         b = summarize([t for t in resolved if lo <= t["confidence"] < hi])

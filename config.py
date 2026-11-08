@@ -20,6 +20,13 @@ COINBASE_WS_URL = "wss://ws-feed.exchange.coinbase.com"
 COINGECKO_REST_URL = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd&include_24hr_vol=true"
 
 
+def _reference_feed() -> str:
+    value = os.environ.get("REFERENCE_FEED", "chainlink_twap").strip().lower()
+    if value not in ("chainlink_twap", "chainlink", "binance"):
+        raise ValueError("REFERENCE_FEED must be chainlink_twap, chainlink or binance")
+    return value
+
+
 @dataclass(frozen=True)
 class BotConfig:
     private_key: str
@@ -56,6 +63,11 @@ class BotConfig:
     # Harvester
     harvest_poll_interval: int
     max_recent_markets: int
+
+    # Stratégie (modèle de probabilité)
+    reference_feed: str = "chainlink_twap"  # chainlink_twap | chainlink | binance
+    min_edge: float = 0.05                  # espérance minimale par part, frais compris
+    basis_noise: float = 25.0               # erreur Binance vs Chainlink (mode binance)
 
     # Paper trading
     paper_trading: bool = False
@@ -97,6 +109,9 @@ class BotConfig:
             min_bet_amount=float(os.environ.get("MIN_BET_AMOUNT", "2.0")),
             harvest_poll_interval=int(os.environ.get("HARVEST_POLL_INTERVAL", "30")),
             max_recent_markets=int(os.environ.get("MAX_RECENT_MARKETS_TO_CHECK", "20")),
+            reference_feed=_reference_feed(),
+            min_edge=float(os.environ.get("MIN_EDGE", "0.05")),
+            basis_noise=float(os.environ.get("BASIS_NOISE_USD", "25.0")),
             paper_trading=paper,
             paper_balance=float(os.environ.get("PAPER_BALANCE", "100.0")),
         )

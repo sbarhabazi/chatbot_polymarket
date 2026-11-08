@@ -34,11 +34,10 @@ def calculate_net_yield(share_price: float, fee_rate: float = 0.072) -> float:
     return (profit - fee) / share_price
 
 
-def paper_payout(shares: float, cost: float, fee_rate: float = 0.072) -> float:
-    """USDC reçus pour une position gagnante : 1 $ par part, moins les frais sur
-    le gain (même taux que calculate_net_yield et compute_kelly_size)."""
-    profit = shares - cost
-    return shares - fee_rate * max(0.0, profit)
+def paper_payout(shares: float) -> float:
+    """USDC reçus pour une position gagnante : 1 $ par part. Les frais taker
+    (0,07 × p × (1 − p) par part) sont payés à l'achat et inclus dans le coût."""
+    return float(shares)
 
 
 def compute_kelly_size(

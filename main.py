@@ -29,7 +29,9 @@ from logger import log
 from market_manager import MarketManager
 from paths import DATA_DIR, HEARTBEAT_FILE
 from price_analyzer import PriceAnalyzer
+from outcome_recorder import OutcomeRecorder
 from profit_taker import ProfitTaker
+from reference_feed import ReferenceFeed
 from sniper import Sniper
 from wallet_manager import WalletManager
 
@@ -52,6 +54,29 @@ async def heartbeat() -> None:
         await asyncio.sleep(HEARTBEAT_INTERVAL)
 
 
+def polybolt_credentials(config: BotConfig, clob_client=None) -> dict | None:
+    """Identifiants API CLOB (L2) pour PolyBolt, dérivés de la clé privée.
+
+    En papier aussi : la dérivation signe un message avec la clé, sans fonds ni
+    transaction. Sans clé, le flux Chainlink est désactivé.
+    """
+    try:
+        if clob_client is None:
+            if not config.private_key or config.private_key == "0x_paper_mode":
+                return None
+            from py_clob_client.client import ClobClient
+            clob_client = ClobClient(host=CLOB_HOST, key=config.private_key,
+                                     chain_id=CHAIN_ID, signature_type=SIGNATURE_TYPE)
+            creds = clob_client.create_or_derive_api_creds()
+        else:
+            creds = clob_client.creds
+        return {"apiKey": creds.api_key, "secret": creds.api_secret,
+                "passphrase": creds.api_passphrase}
+    except Exception as e:
+        log.error("Identifiants API CLOB impossibles à dériver : %s", e)
+        return None
+
+
 async def main() -> None:
     config = BotConfig.from_env()
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -69,8 +94,9 @@ async def main() -> None:
         market_manager = MarketManager(config)
         price_analyzer = PriceAnalyzer(config)
         wallet_manager = WalletManager(config)
+        reference_feed = ReferenceFeed(polybolt_credentials(config))
         sniper = Sniper(config, market_manager, price_analyzer, wallet_manager,
-                        learning_engine=learning_engine)
+                        learning_engine=learning_engine, reference_feed=reference_feed)
         w3 = None
         clob_client = None
     else:
@@ -121,8 +147,10 @@ async def main() -> None:
         market_manager = MarketManager(config)
         price_analyzer = PriceAnalyzer(config)
         wallet_manager = WalletManager(config, clob_client, w3)
+        reference_feed = ReferenceFeed(polybolt_credentials(config, clob_client))
         sniper = Sniper(config, market_manager, price_analyzer, wallet_manager,
-                        clob_client, w3, learning_engine=learning_engine)
+                        clob_client, w3, learning_engine=learning_engine,
+                        reference_feed=reference_feed)
 
     # Log balance
     balance = await wallet_manager.get_usdc_balance(force_refresh=True)
@@ -173,30 +201,28 @@ async def main() -> None:
 
     # Start
     await price_analyzer.start()
+    await reference_feed.start()
+    if config.reference_feed != "binance" and not reference_feed.enabled:
+        log.error("REFERENCE_FEED=%s exige le flux Chainlink (PRIVATE_KEY requise pour "
+                  "les identifiants API) : aucun trade possible. Renseigner PRIVATE_KEY "
+                  "ou REFERENCE_FEED=binance.", config.reference_feed)
 
     log.info("=" * 50)
-    log.info("POLYMARKET 5-MIN BTC SNIPER BOT v6 RUNNING")
-    log.info("  Sizing: Kelly (fraction=%.0f%%, max=%.0f%%)",
-             config.kelly_fraction * 100, config.max_kelly_size * 100)
-    log.info("  Max buy price (CLOB ask): $%.2f (min yield ~%.0f%%)",
-             config.max_buy_price,
-             ((1 - config.max_buy_price) / config.max_buy_price) * 100)
+    log.info("POLYMARKET 5-MIN BTC BOT v7 RUNNING — modèle de probabilité")
+    log.info("  Référence: %s | edge min: %.2f $/part | max ask: $%.2f",
+             config.reference_feed, config.min_edge, config.max_buy_price)
     log.info("  Entry window: last %ds", config.entry_window_seconds)
     log.info("  Ask buffer: +$%.2f | Order type: %s", config.ask_buffer, config.order_type)
-    log.info("  Min BTC distance: $%.0f (Binance vs Binance à l'ouverture)", config.min_btc_distance)
-    if config.min_btc_distance < 25:
-        log.warning("MIN_BTC_DISTANCE=$%.0f < $25 : mesuré le 2026-11-02, la variation Binance "
-                    "ne donnait le bon gagnant que 47 fois sur 53 au-delà de 12 $ "
-                    "(43 sur 44 au-delà de 25 $)", config.min_btc_distance)
     if "FILL_BUFFER" in os.environ:
         log.warning("FILL_BUFFER est ignoré (il n'a jamais été appliqué) : "
                     "utiliser ASK_BUFFER (défaut $0.02 au-dessus du meilleur vendeur)")
-    log.info("  Signals: OBI + Momentum + Volume + RSI + VWAP + TradeRate")
     log.info("=" * 50)
 
     tasks_to_run.append(asyncio.create_task(sniper.run(), name="sniper"))
     tasks_to_run.append(asyncio.create_task(shutdown_event.wait(), name="shutdown"))
     tasks_to_run.append(asyncio.create_task(heartbeat(), name="heartbeat"))
+    tasks_to_run.append(asyncio.create_task(OutcomeRecorder(market_manager).run(),
+                                            name="outcome_recorder"))
 
     # Process D: Balance Guard (live mode seulement)
     if not config.paper_trading and w3 is not None:
@@ -224,6 +250,7 @@ async def main() -> None:
                 pass
     finally:
         await price_analyzer.stop()
+        await reference_feed.stop()
         await market_manager.close()
 
         if config.paper_trading and sniper._paper_trades:

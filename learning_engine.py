@@ -73,6 +73,7 @@ class TradeRecord:
     payout: float = 0.0          # montant reçu si gagné
     timestamp: float = field(default_factory=time.time)
     source: str = "live"         # "live" ou "paper"
+    shares: Optional[float] = None  # nombre de parts (paiement = 1 $ par part gagnante)
 
 
 class LearningEngine:

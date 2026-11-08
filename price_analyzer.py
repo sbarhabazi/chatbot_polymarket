@@ -44,7 +44,22 @@ warnings.filterwarnings("ignore", message="Polyfit may be poorly conditioned")
 # d'ouverture de la fenêtre de 5 minutes en cours.
 PRICE_RETENTION_SECONDS = 420
 PRICE_BUFFER_HARD_CAP = 500_000  # garde-fou mémoire
+BINANCE_RETRIES = 5             # reconnexions Binance avant une source de secours
+FALLBACK_MAX_SECONDS = 300      # durée max sur une source de secours avant de retenter Binance
+STREAM_IDLE_TIMEOUT = 30        # aucun message pendant 30 s : flux considéré mort
 BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
+
+
+async def _with_idle_timeout(ws, timeout: float = None):
+    """Itère sur les messages d'un websocket ; lève TimeoutError si le flux se tait
+    plus de STREAM_IDLE_TIMEOUT secondes (connexion morte sans fermeture)."""
+    timeout = timeout or STREAM_IDLE_TIMEOUT
+    while True:
+        try:
+            message = await asyncio.wait_for(ws.recv(), timeout=timeout)
+        except websockets.ConnectionClosedOK:
+            return
+        yield message
 
 
 class PriceAnalyzer:
@@ -122,6 +137,22 @@ class PriceAnalyzer:
             return None
         return found.price
 
+    def volatility_per_sqrt_s(self, lookback: float = 300.0) -> float | None:
+        """Écart-type des variations de prix par √seconde (dollars), à partir de
+        la dernière transaction de chaque seconde. None si moins de 60 points."""
+        cutoff = time.time() - lookback
+        per_second: dict[int, float] = {}
+        for p in self._prices:
+            if p.timestamp >= cutoff:
+                per_second[int(p.timestamp)] = p.price
+        secs = sorted(per_second)
+        diffs = [(per_second[b] - per_second[a]) / ((b - a) ** 0.5)
+                 for a, b in zip(secs, secs[1:]) if 0 < b - a <= 5]
+        if len(diffs) < 60:
+            return None
+        mean = sum(diffs) / len(diffs)
+        return (sum((d - mean) ** 2 for d in diffs) / (len(diffs) - 1)) ** 0.5
+
     async def fetch_binance_price_at(self, ts: int) -> float | None:
         """Prix Binance BTCUSDT à la seconde `ts` (ouverture de la bougie 1 s).
         Sert quand le bot démarre en cours de fenêtre."""
@@ -142,31 +173,48 @@ class PriceAnalyzer:
     # ─── Smart Source Selector ──────────────────────────────────
 
     async def _connect_best_trade_source(self) -> None:
-        """Try sources in order: Binance → Kraken → Coinbase → CoinGecko REST."""
-        sources = [
-            ("Binance", self._consume_binance_trades),
+        """Binance d'abord, toujours.
+
+        Une coupure de Binance (même propre, sans erreur) est d'abord réessayée
+        BINANCE_RETRIES fois. Ensuite seulement on passe à Kraken puis Coinbase,
+        chacun pour FALLBACK_MAX_SECONDS au plus, avant de revenir à Binance.
+        Avant (2026-11-04), une coupure de Binance faisait glisser le bot de
+        source en source jusqu'à CoinGecko, sans retour : trois jours sans trade.
+        CoinGecko (un prix par minute) n'est plus utilisé : inutilisable ici.
+        """
+        fallbacks = [
             ("Kraken", self._consume_kraken_trades),
             ("Coinbase", self._consume_coinbase_trades),
-            ("CoinGecko REST", self._consume_coingecko_rest),
         ]
-
         while self._running:
-            for name, consumer in sources:
+            for attempt in range(1, BINANCE_RETRIES + 1):
                 if not self._running:
                     return
-                log.info("Trying price source: %s...", name)
-                try:
-                    await consumer()
-                    # If consumer returns normally, source failed — try next
-                except asyncio.CancelledError:
+                await self._run_source("Binance", self._consume_binance_trades)
+                if not self._running:
                     return
-                except Exception as e:
-                    log.warning("%s failed: %s", name, e)
+                await asyncio.sleep(min(2 ** attempt, 30))
+            for name, consumer in fallbacks:
+                if not self._running:
+                    return
+                try:
+                    await asyncio.wait_for(self._run_source(name, consumer),
+                                           timeout=FALLBACK_MAX_SECONDS)
+                except asyncio.TimeoutError:
+                    log.info("%s: retour à Binance après %ds", name, FALLBACK_MAX_SECONDS)
                     self._connected = False
+                    break  # repartir de Binance
 
-            # All sources exhausted — wait before retry cycle
-            log.error("All price sources failed. Retrying in 30s...")
-            await asyncio.sleep(30)
+    async def _run_source(self, name: str, consumer) -> None:
+        log.info("Trying price source: %s...", name)
+        try:
+            await consumer()
+            log.warning("%s stream ended", name)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.warning("%s failed: %s", name, e)
+        self._connected = False
 
     # ─── Binance Trade Stream ──────────────────────────────────
 
@@ -177,7 +225,7 @@ class PriceAnalyzer:
                 self._connected = True
                 self._active_source = "Binance"
                 log.info("Binance Trade WS connected")
-                async for message in ws:
+                async for message in _with_idle_timeout(ws):
                     if not self._running:
                         break
                     data = json.loads(message)
@@ -213,7 +261,7 @@ class PriceAnalyzer:
             self._active_source = "Kraken"
             log.info("Kraken Trade WS connected (BTC/USD)")
 
-            async for message in ws:
+            async for message in _with_idle_timeout(ws):
                 if not self._running:
                     break
                 data = json.loads(message)
@@ -244,7 +292,7 @@ class PriceAnalyzer:
             self._active_source = "Coinbase"
             log.info("Coinbase Trade WS connected (BTC-USD)")
 
-            async for message in ws:
+            async for message in _with_idle_timeout(ws):
                 if not self._running:
                     break
                 data = json.loads(message)
@@ -334,7 +382,7 @@ class PriceAnalyzer:
                     self._depth_connected = True
                     backoff = 1
                     log.info("Binance Depth WS connected (top 20 levels, 100ms)")
-                    async for message in ws:
+                    async for message in _with_idle_timeout(ws):
                         if not self._running:
                             break
                         data = json.loads(message)
